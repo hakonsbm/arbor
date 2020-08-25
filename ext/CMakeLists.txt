@@ -3,10 +3,16 @@
 add_library(ext-json INTERFACE)
 target_include_directories(ext-json INTERFACE json/single_include)
 
-# TCLAP command line parsing libary (header-only).
+# tinyopt command line parsing libary (header-only).
 
-add_library(ext-tclap INTERFACE)
-target_include_directories(ext-tclap INTERFACE tclap/include)
+add_library(ext-tinyopt INTERFACE)
+target_include_directories(ext-tinyopt INTERFACE tinyopt/include)
+
+# Random123 (DE Shaw Research) counter-based random number generators (header-only)
+
+add_library(ext-random123 INTERFACE)
+target_include_directories(ext-random123 INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/random123/include)
+install(TARGETS ext-random123 EXPORT arbor-targets)
 
 # Google benchmark for microbenchmarks:
 

@@ -1,13 +1,15 @@
-#include <set>
 #include <string>
 #include <vector>
+#include <stack>
 
-#include <arbor/morph/error.hpp>
 #include <arbor/morph/locset.hpp>
 #include <arbor/morph/primitives.hpp>
+#include <arbor/morph/morphexcept.hpp>
+#include <arbor/morph/mprovider.hpp>
 #include <arbor/morph/region.hpp>
+#include <arbor/util/optional.hpp>
 
-#include "morph/em_morphology.hpp"
+#include "util/mergeview.hpp"
 #include "util/span.hpp"
 #include "util/strprintf.hpp"
 #include "util/range.hpp"
@@ -16,142 +18,120 @@
 namespace arb {
 namespace reg {
 
-// Returns true iff cable sections a and b:
-//  1. are on the same branch
-//  2. overlap, i.e. their union is not empty.
-bool is_disjoint(const mcable& a, const mcable& b) {
-    if (a.branch!=b.branch) return true;
-    return a<b? a.dist_pos<b.prox_pos: b.dist_pos<a.prox_pos;
+util::optional<mcable> intersect(const mcable& a, const mcable& b) {
+    if (a.branch!=b.branch) return util::nullopt;
+
+    double prox = std::max(a.prox_pos, b.prox_pos);
+    double dist = std::min(a.dist_pos, b.dist_pos);
+    return prox<=dist? util::just(mcable{a.branch, prox, dist}): util::nullopt;
 }
 
-// Take the union of two cable sections that are not disjoint.
-mcable make_union(const mcable& a, const mcable& b) {
-    assert(!is_disjoint(a,b));
-    return mcable{a.branch, std::min(a.prox_pos, b.prox_pos), std::max(a.dist_pos, b.dist_pos)};
-}
+// Empty region.
 
-// Take the intersection of two cable sections that are not disjoint.
-mcable make_intersection(const mcable& a, const mcable& b) {
-    assert(!is_disjoint(a,b));
-
-    return mcable{a.branch, std::max(a.prox_pos, b.prox_pos), std::min(a.dist_pos, b.dist_pos)};
-}
-
-mcable_list merge(const mcable_list& v) {
-    if (v.size()<2) return v;
-    std::vector<mcable> L;
-    L.reserve(v.size());
-    auto c = v.front();
-    auto it = v.begin()+1;
-    while (it!=v.end()) {
-        if (!is_disjoint(c, *it)) {
-            c = make_union(c, *it);
-        }
-        else {
-            L.push_back(c);
-            c = *it;
-        }
-        ++it;
-    }
-    L.push_back(c);
-    return L;
-}
-
-// Insert a zero-length region at the start of each child branch for every cable
-// that includes the end of a branch.
-// Insert a zero-length region at the end of the parent branch for each cable
-// that includes the start of the branch.
-mcable_list cover(mcable_list cables, const em_morphology& m) {
-    mcable_list L;
-    for (auto& c: cables) {
-        if (c.prox_pos==0) {
-            for (auto& x: m.cover(mlocation{c.branch, 0}, false)) {
-                L.push_back({x.branch, x.pos, x.pos});
-            }
-        }
-        if (c.dist_pos==1) {
-            for (auto& x: m.cover(mlocation{c.branch, 1}, false)) {
-                L.push_back({x.branch, x.pos, x.pos});
-            }
-        }
-    }
-    L.insert(L.end(), cables.begin(), cables.end());
-    util::sort(L);
-
-    return L;
-}
-
-mcable_list remove_cover(mcable_list cables, const em_morphology& m) {
-    // Find all zero-length cables at the end of cables, and convert to
-    // their canonical representation.
-    for (auto& c: cables) {
-        if (c.dist_pos==0 || c.prox_pos==1) {
-            auto cloc = m.canonicalize({c.branch, c.prox_pos});
-            c = {cloc.branch, cloc.pos, cloc.pos};
-        }
-    }
-    // Some new zero-length cables may be out of order, so sort
-    // the cables.
-    util::sort(cables);
-
-    // Remove multiple copies of zero-length cables if present.
-    return merge(cables);
-}
-
-//
-// Null/empty region
-//
-struct nil_ {};
+struct nil_: region_tag {};
 
 region nil() {
     return region{nil_{}};
 }
 
-mcable_list thingify_(const nil_& x, const em_morphology& m) {
-    return {};
+mextent thingify_(const nil_& x, const mprovider&) {
+    return mextent{};
 }
 
 std::ostream& operator<<(std::ostream& o, const nil_& x) {
     return o << "nil";
 }
 
-//
-// Explicit cable section
-//
 
-struct cable_ {
+// Explicit cable section.
+
+struct cable_: region_tag {
+    explicit cable_(mcable c): cable(std::move(c)) {}
     mcable cable;
 };
 
-region cable(mcable c) {
+region cable(msize_t id, double prox, double dist) {
+    mcable c{id, prox, dist};
     if (!test_invariants(c)) {
-        throw morphology_error(util::pprintf("Invalid cable section {}", c));
+        throw invalid_mcable(c);
     }
     return region(cable_{c});
 }
 
 region branch(msize_t bid) {
-    return cable({bid, 0, 1});
+    return cable(bid, 0, 1);
 }
 
-mcable_list thingify_(const cable_& reg, const em_morphology& em) {
-    auto& m = em.morph();
-
-    if (reg.cable.branch>=m.num_branches()) {
-        throw morphology_error(util::pprintf("Branch {} does not exist in morpology", reg.cable.branch));
+mextent thingify_(const cable_& reg, const mprovider& p) {
+    if (reg.cable.branch>=p.morphology().num_branches()) {
+        throw no_such_branch(reg.cable.branch);
     }
-
-    return {reg.cable};
+    return mextent(mcable_list{{reg.cable}});
 }
 
 std::ostream& operator<<(std::ostream& o, const cable_& c) {
     return o << c.cable;
 }
 
-//
-// region with all segments with the same numeric tag
-//
-struct tagged_ {
+// Exlicit list of cables.
+// (Not part of front-end API: used by region ctor.)
+
+struct cable_list_: region_tag {
+    explicit cable_list_(mcable_list cs): cables(std::move(cs)) {}
+    mcable_list cables;
+};
+
+region cable_list(mcable_list cs) {
+    if (!test_invariants(cs)) { throw invalid_mcable_list(); }
+    return region(cable_list_{std::move(cs)});
+}
+
+mextent thingify_(const cable_list_& reg, const mprovider& p) {
+    if (reg.cables.empty()) {
+        return mextent{};
+    }
+
+    auto last_branch = reg.cables.back().branch;
+    if (last_branch>=p.morphology().num_branches()) {
+        throw no_such_branch(last_branch);
+    }
+    return mextent(reg.cables);
+}
+
+std::ostream& operator<<(std::ostream& o, const cable_list_& x) {
+    o << "(cable_list";
+    for (auto c: x.cables) { o << ' ' << c; }
+    return o << ')';
+}
+
+// Explicit extent.
+// (Not part of front-end API: used by region ctor.)
+
+struct extent_: region_tag {
+    explicit extent_(mextent x): extent(std::move(x)) {}
+    mextent extent;
+};
+
+region extent(mextent x) {
+    arb_assert(x.test_invariants());
+    return region(extent_{std::move(x)});
+}
+
+mextent thingify_(const extent_& x, const mprovider& p) {
+    arb_assert(x.extent.test_invariants(p.morphology()));
+    return x.extent;
+}
+
+std::ostream& operator<<(std::ostream& o, const extent_& x) {
+    o << "(extent";
+    for (auto c: x.extent.cables()) { o << ' ' << c; }
+    return o << ')';
+}
+
+// Region with all segments with the same numeric tag.
+
+struct tagged_: region_tag {
+    explicit tagged_(int tag): tag(tag) {}
     int tag;
 };
 
@@ -159,155 +139,572 @@ region tagged(int id) {
     return region(tagged_{id});
 }
 
-mcable_list thingify_(const tagged_& reg, const em_morphology& em) {
-    auto& m = em.morph();
+mextent thingify_(const tagged_& reg, const mprovider& p) {
+    const auto& m = p.morphology();
+    const auto& e = p.embedding();
     size_t nb = m.num_branches();
 
     std::vector<mcable> L;
     L.reserve(nb);
-    auto& samples = m.samples();
-    auto matches     = [reg, &samples](msize_t i) {return samples[i].tag==reg.tag;};
-    auto not_matches = [&matches](msize_t i) {return !matches(i);};
+    auto matches     = [reg](auto& seg){return seg.tag==reg.tag;};
+    auto not_matches = [&matches](auto& seg) {return !matches(seg);};
 
     for (msize_t i: util::make_span(nb)) {
-        auto ids = util::make_range(m.branch_indexes(i)); // range of sample ids in branch.
-        size_t ns = util::size(ids);        // number of samples in branch.
+        auto& segs = m.branch_segments(i); // Range of segments in the branch.
+        auto locs = util::make_range(e.branch_segment_locations(i));
 
-        if (ns==1) {
-            // The branch is a spherical soma
-            if (samples[0].tag==reg.tag) {
-                L.push_back({0,0,1});
-            }
-            continue;
-        }
+        auto beg = std::cbegin(segs);
+        auto end = std::cend(segs);
 
-        // The branch has at least 2 samples.
-        // Start at begin+1 because a segment gets its tag from its distal sample.
-        auto beg = std::cbegin(ids);
-        auto end = std::cend(ids);
-
-        // Find the next sample that matches reg.tag.
-        auto start = std::find_if(beg+1, end, matches);
+        // Find the next section that matches reg.tag.
+        auto start = std::find_if(beg, end, [reg](auto& seg){return seg.tag==reg.tag;});
         while (start!=end) {
             // find the next sample that does not match reg.tag
-            auto first = start-1;
             auto last = std::find_if(start, end, not_matches);
 
-            auto l = first==beg? 0.: em.sample2loc(*first).pos;
-            auto r = last==end?  1.: em.sample2loc(*(last-1)).pos;
+            auto l = locs[start-beg].pos;
+            auto r = last==end? 1: locs[last-beg].pos;
             L.push_back({i, l, r});
 
             // Find the next sample in the branch that matches reg.tag.
             start = std::find_if(last, end, matches);
         }
     }
-    if (L.size()<L.capacity()/4) {
-        L.shrink_to_fit();
-    }
-    return L;
+
+    return mextent(L);
 }
 
 std::ostream& operator<<(std::ostream& o, const tagged_& t) {
     return o << "(tag " << t.tag << ")";
 }
 
-//
-// region with all segments in a cell
-//
-struct all_ {};
+// Region comprising whole morphology.
+
+struct all_: region_tag {};
 
 region all() {
     return region(all_{});
 }
 
-mcable_list thingify_(const all_&, const em_morphology& m) {
-    auto nb = m.morph().num_branches();
+mextent thingify_(const all_&, const mprovider& p) {
+    auto nb = p.morphology().num_branches();
     mcable_list branches;
     branches.reserve(nb);
     for (auto i: util::make_span(nb)) {
         branches.push_back({i,0,1});
     }
-    return branches;
+    return mextent(branches);
 }
 
 std::ostream& operator<<(std::ostream& o, const all_& t) {
-    return o << "all";
+    return o << "(all)";
 }
 
-//
-// intersection of two regions.
-//
-struct reg_and {
+// Region comprising points up to `distance` distal to a point in `start`.
+
+struct distal_interval_ {
+    locset start;
+    double distance; //um
+};
+
+region distal_interval(locset start, double distance) {
+    return region(distal_interval_{start, distance});
+}
+
+mextent thingify_(const distal_interval_& reg, const mprovider& p) {
+    const auto& m = p.morphology();
+    const auto& e = p.embedding();
+
+    std::vector<mcable> L;
+
+    auto start = thingify(reg.start, p);
+    auto distance = reg.distance;
+
+    struct branch_interval {
+        msize_t bid;
+        double distance;
+    };
+
+    for (auto c: start) {
+        std::stack<branch_interval> branches_reached;
+        bool first_branch = true;
+
+        // if we're starting at the end of a branch, start traversal with its children
+        if (c.pos < 1) {
+            branches_reached.push({c.branch, distance});
+        } else {
+            first_branch = false;
+            L.push_back({c.branch,1,1});
+            for (auto child: m.branch_children(c.branch)) {
+                branches_reached.push({child, distance});
+            }
+        }
+
+        while (!branches_reached.empty()) {
+            auto bi = branches_reached.top();
+            branches_reached.pop();
+
+            auto branch = bi.bid;
+            auto rem_dist = bi.distance;
+
+            auto branch_length = e.branch_length(branch);
+            auto prox_pos = first_branch*c.pos;
+            auto dist_pos = rem_dist / branch_length + prox_pos;
+
+            if (dist_pos <= 1) {
+                L.push_back({branch, prox_pos, dist_pos});
+            } else {
+                L.push_back({branch, prox_pos, 1});
+                rem_dist = rem_dist - (1 - prox_pos)*branch_length;
+                for (auto child: m.branch_children(branch)) {
+                    branches_reached.push({child, rem_dist});
+                }
+            }
+            first_branch = false;
+        }
+    }
+
+    util::sort(L);
+    return mextent(L);
+}
+
+std::ostream& operator<<(std::ostream& o, const distal_interval_& d) {
+    return o << "(distal_interval " << d.start << " " << d.distance << ")";
+}
+
+// Region comprising points up to `distance` proximal to a point in `end`.
+
+struct proximal_interval_ {
+    locset end;
+    double distance; //um
+};
+
+region proximal_interval(locset end, double distance) {
+    return region(proximal_interval_{end, distance});
+}
+
+mextent thingify_(const proximal_interval_& reg, const mprovider& p) {
+    const auto& m = p.morphology();
+    const auto& e = p.embedding();
+
+    std::vector<mcable> L;
+
+    auto start = thingify(reg.end, p);
+    auto distance = reg.distance;
+
+    for (auto c: start) {
+        auto branch = c.branch;
+        auto branch_length = e.branch_length(branch);
+        auto rem_dist = distance;
+
+        auto dist_pos = c.pos;
+        auto prox_pos = dist_pos - distance / branch_length;
+
+        while (prox_pos < 0) {
+            L.push_back({branch, 0, dist_pos});
+
+            rem_dist = rem_dist - dist_pos*branch_length;
+
+            branch = m.branch_parent(branch);
+            if (branch == mnpos) {
+                break;
+            }
+
+            dist_pos = 1;
+            prox_pos = dist_pos - rem_dist / e.branch_length(branch);
+        }
+        if (branch != mnpos) {
+            L.push_back({branch, prox_pos, dist_pos});
+        }
+    }
+
+    util::sort(L);
+    return mextent(L);
+}
+
+std::ostream& operator<<(std::ostream& o, const proximal_interval_& d) {
+    return o << "(proximal_interval " << d.end << " " << d.distance << ")";
+}
+
+mextent radius_cmp(const mprovider& p, region r, double val, comp_op op) {
+    const auto& e = p.embedding();
+    auto reg_extent = thingify(r, p);
+
+    msize_t bid = mnpos;
+    mcable_list cmp_cables;
+
+    for (auto c: reg_extent) {
+        if (bid != c.branch) {
+            bid = c.branch;
+            util::append(cmp_cables, e.radius_cmp(bid, val, op));
+        }
+    }
+
+    return intersect(reg_extent, mextent(cmp_cables));
+}
+
+// Region with all segments with radius less than r
+struct radius_lt_ {
+    region reg;
+    double val; //um
+};
+
+region radius_lt(region reg, double val) {
+    return region(radius_lt_{reg, val});
+}
+
+mextent thingify_(const radius_lt_& r, const mprovider& p) {
+    return radius_cmp(p, r.reg, r.val, comp_op::lt);
+}
+
+std::ostream& operator<<(std::ostream& o, const radius_lt_& r) {
+    return o << "(radius_lt " << r.reg << " " << r.val << ")";
+}
+
+// Region with all segments with radius less than r
+struct radius_le_ {
+    region reg;
+    double val; //um
+};
+
+region radius_le(region reg, double val) {
+    return region(radius_le_{reg, val});
+}
+
+mextent thingify_(const radius_le_& r, const mprovider& p) {
+    return radius_cmp(p, r.reg, r.val, comp_op::le);
+}
+
+std::ostream& operator<<(std::ostream& o, const radius_le_& r) {
+    return o << "(radius_le " << r.reg << " " << r.val << ")";
+}
+
+// Region with all segments with radius greater than r
+struct radius_gt_ {
+    region reg;
+    double val; //um
+};
+
+region radius_gt(region reg, double val) {
+    return region(radius_gt_{reg, val});
+}
+
+mextent thingify_(const radius_gt_& r, const mprovider& p) {
+    return radius_cmp(p, r.reg, r.val, comp_op::gt);
+}
+
+std::ostream& operator<<(std::ostream& o, const radius_gt_& r) {
+    return o << "(radius_gt " << r.reg << " " << r.val << ")";
+}
+
+// Region with all segments with radius greater than or equal to r
+struct radius_ge_ {
+    region reg;
+    double val; //um
+};
+
+region radius_ge(region reg, double val) {
+    return region(radius_ge_{reg, val});
+}
+
+mextent thingify_(const radius_ge_& r, const mprovider& p) {
+    return radius_cmp(p, r.reg, r.val, comp_op::ge);
+}
+
+std::ostream& operator<<(std::ostream& o, const radius_ge_& r) {
+    return o << "(radius_ge " << r.reg << " " << r.val << ")";
+}
+
+mextent projection_cmp(const mprovider& p, double v, comp_op op) {
+    const auto& m = p.morphology();
+    const auto& e = p.embedding();
+
+    std::vector<mcable> L;
+    auto val = v;
+    for (auto i: util::make_span(m.num_branches())) {
+        util::append(L, e.projection_cmp(i, val, op));
+    }
+    return mextent(L);
+}
+
+// Region with all segments with projection less than val
+struct projection_lt_{
+    double val; //um
+};
+
+region projection_lt(double val) {
+    return region(projection_lt_{val});
+}
+
+mextent thingify_(const projection_lt_& r, const mprovider& p) {
+    return projection_cmp(p, r.val, comp_op::lt);
+}
+
+std::ostream& operator<<(std::ostream& o, const projection_lt_& r) {
+    return o << "(projection_lt " << r.val << ")";
+}
+
+// Region with all segments with projection less than or equal to val
+struct projection_le_{
+    double val; //um
+};
+
+region projection_le(double val) {
+    return region(projection_le_{val});
+}
+
+mextent thingify_(const projection_le_& r, const mprovider& p) {
+    return projection_cmp(p, r.val, comp_op::le);
+}
+
+std::ostream& operator<<(std::ostream& o, const projection_le_& r) {
+    return o << "(projection_le " << r.val << ")";
+}
+
+// Region with all segments with projection greater than val
+struct projection_gt_ {
+    double val; //um
+};
+
+region projection_gt(double val) {
+    return region(projection_gt_{val});
+}
+
+mextent thingify_(const projection_gt_& r, const mprovider& p) {
+    return projection_cmp(p, r.val, comp_op::gt);
+}
+
+std::ostream& operator<<(std::ostream& o, const projection_gt_& r) {
+    return o << "(projection_gt " << r.val << ")";
+}
+
+// Region with all segments with projection greater than val
+struct projection_ge_ {
+    double val; //um
+};
+
+region projection_ge(double val) {
+    return region(projection_ge_{val});
+}
+
+mextent thingify_(const projection_ge_& r, const mprovider& p) {
+    return projection_cmp(p, r.val, comp_op::ge);
+}
+
+std::ostream& operator<<(std::ostream& o, const projection_ge_& r) {
+    return o << "(projection_ge " << r.val << ")";
+}
+
+region z_dist_from_root_lt(double r0) {
+    if (r0 == 0) {
+        return {};
+    }
+    region lt = reg::projection_lt(r0);
+    region gt = reg::projection_gt(-r0);
+    return intersect(std::move(lt), std::move(gt));
+}
+
+region z_dist_from_root_le(double r0) {
+    region le = reg::projection_le(r0);
+    region ge = reg::projection_ge(-r0);
+    return intersect(std::move(le), std::move(ge));
+}
+
+region z_dist_from_root_gt(double r0) {
+    region lt = reg::projection_lt(-r0);
+    region gt = reg::projection_gt(r0);
+    return region{join(std::move(lt), std::move(gt))};
+}
+
+region z_dist_from_root_ge(double r0) {
+    region lt = reg::projection_le(-r0);
+    region gt = reg::projection_ge(r0);
+    return region{join(std::move(lt), std::move(gt))};
+}
+
+// Named region.
+struct named_: region_tag {
+    explicit named_(std::string name): name(std::move(name)) {}
+    std::string name;
+};
+
+region named(std::string name) {
+    return region(named_{std::move(name)});
+}
+
+mextent thingify_(const named_& n, const mprovider& p) {
+    return p.region(n.name);
+}
+
+std::ostream& operator<<(std::ostream& o, const named_& x) {
+    return o << "(region \"" << x.name << "\")";
+}
+
+// Adds all cover points to a region.
+// Ensures that all valid representations of all fork points in the region are included.
+struct super_ {
+    region reg;
+};
+
+region complete(region r) {
+    return region(super_{std::move(r)});
+}
+
+mextent thingify_(const super_& r, const mprovider& p) {
+    const auto& m = p.morphology();
+    auto cables = thingify(r.reg, p).cables();
+    std::unordered_set<msize_t> branch_tails;
+
+    mcable_list cs;
+    for (auto& c: cables) {
+        mcable* prev = cs.empty()? nullptr: &cs.back();
+
+        if (c.prox_pos==0) {
+            branch_tails.insert(m.branch_parent(c.branch));
+        }
+        if (c.dist_pos==1) {
+            branch_tails.insert(c.branch);
+        }
+
+        if (prev && prev->branch==c.branch && prev->dist_pos>=c.prox_pos) {
+            prev->dist_pos = std::max(prev->dist_pos, c.dist_pos);
+        }
+        else {
+            cs.push_back(c);
+        }
+    }
+
+    if (!branch_tails.empty()) {
+        std::vector<mcable> fork_covers;
+
+        for (auto b: branch_tails) {
+            if (b!=mnpos) fork_covers.push_back(mcable{b, 1., 1.});
+            for (auto b_child: m.branch_children(b)) {
+                fork_covers.push_back(mcable{b_child, 0., 0.});
+            }
+        }
+        util::sort(fork_covers);
+
+        // Merge cables in cs with 0-length cables corresponding to fork covers.
+        mcable_list a;
+        a.swap(cs);
+
+        for (auto c: util::merge_view(a, fork_covers)) {
+            mcable* prev = cs.empty()? nullptr: &cs.back();
+
+            if (prev && prev->branch==c.branch && prev->dist_pos>=c.prox_pos) {
+                prev->dist_pos = std::max(prev->dist_pos, c.dist_pos);
+            }
+            else {
+                cs.push_back(c);
+            }
+        }
+    }
+
+    return {cs};
+}
+
+std::ostream& operator<<(std::ostream& o, const super_& r) {
+    return o << "(complete " << r.reg << ")";
+}
+
+
+// Intersection of two regions.
+
+struct reg_and: region_tag {
     region lhs;
     region rhs;
     reg_and(region lhs, region rhs): lhs(std::move(lhs)), rhs(std::move(rhs)) {}
 };
 
-mcable_list thingify_(const reg_and& P, const em_morphology& m) {
-    using cable_it = std::vector<mcable>::const_iterator;
-    using cable_it_pair = std::pair<cable_it, cable_it>;
-
-    auto lhs = cover(thingify(P.lhs, m), m);
-    auto rhs = cover(thingify(P.rhs, m), m);
-
-    // Perform intersection
-    cable_it_pair it{lhs.begin(), rhs.begin()};
-    cable_it_pair end{lhs.end(), rhs.end()};
-    std::vector<mcable> L;
-
-    bool at_end = it.first==end.first || it.second==end.second;
-    while (!at_end) {
-        bool first_less = *(it.first) < *(it.second);
-        auto& lhs = first_less? it.first: it.second;
-        auto& rhs = first_less? it.second: it.first;
-        if (!is_disjoint(*lhs, *rhs)) {
-            L.push_back(make_intersection(*lhs, *rhs));
-        }
-        if (dist_loc(*lhs) < dist_loc(*rhs)) {
-            ++lhs;
-        }
-        else {
-            ++rhs;
-        }
-        at_end = it.first==end.first || it.second==end.second;
-    }
-
-    return remove_cover(L, m);
+mextent thingify_(const reg_and& P, const mprovider& p) {
+    return intersect(thingify(P.lhs, p), thingify(P.rhs, p));
 }
 
 std::ostream& operator<<(std::ostream& o, const reg_and& x) {
     return o << "(intersect " << x.lhs << " " << x.rhs << ")";
 }
 
-//
-// union of two point sets
-//
-struct reg_or {
+
+// Union of two regions.
+
+struct reg_or: region_tag {
     region lhs;
     region rhs;
     reg_or(region lhs, region rhs): lhs(std::move(lhs)), rhs(std::move(rhs)) {}
 };
 
-mcable_list thingify_(const reg_or& P, const em_morphology& m) {
-    auto lhs = thingify(P.lhs, m);
-    auto rhs = thingify(P.rhs, m);
-    mcable_list L;
-    L.resize(lhs.size() + rhs.size());
-
-    std::merge(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), L.begin());
-
-    return merge(L);
+mextent thingify_(const reg_or& P, const mprovider& p) {
+    return join(thingify(P.lhs, p), thingify(P.rhs, p));
 }
 
 std::ostream& operator<<(std::ostream& o, const reg_or& x) {
     return o << "(join " << x.lhs << " " << x.rhs << ")";
 }
 
+
+// Complement of a region.
+
+struct reg_not: region_tag {
+    region r;
+    explicit reg_not(region r): r(std::move(r)) {}
+};
+
+mextent thingify_(const reg_not& P, const mprovider& p) {
+    auto nb = p.morphology().num_branches();
+    mcable_list result;
+
+    mextent rex = thingify(P.r, p);
+    auto rex_i = rex.begin();
+
+    for (auto i: util::make_span(nb)) {
+        while (rex_i!=rex.end() && rex_i->branch<i) ++rex_i;
+
+        double x = 0;
+        while (rex_i!=rex.end() && rex_i->branch==i) {
+            double y = rex_i->prox_pos;
+            if (y>x) {
+                result.push_back(mcable{i, x, y});
+            }
+
+            x = rex_i->dist_pos;
+            ++rex_i;
+        }
+
+        if (x<1) {
+            result.push_back(mcable{i, x, 1});
+        }
+    }
+
+    return mextent(result);
+}
+
+std::ostream& operator<<(std::ostream& o, const reg_not& x) {
+    return o << "(complement " << x.r << ")";
+}
+
+
+// Closed set difference of two regions.
+
+struct reg_minus: region_tag {
+    region lhs;
+    region rhs;
+    reg_minus(region lhs, region rhs): lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+};
+
+mextent thingify_(const reg_minus& P, const mprovider& p) {
+    return thingify(intersect(std::move(P.lhs), complement(std::move(P.rhs))), p);
+}
+
+std::ostream& operator<<(std::ostream& o, const reg_minus& x) {
+    return o << "(difference " << x.lhs << " " << x.rhs << ")";
+}
+
 } // namespace reg
 
-// The intersect and join operations in the arb:: namespace with region so that
-// ADL allows for construction of expressions with regions without having
-// to namespace qualify the intersect/join.
+// The intersect, join, complement and difference operations are in the arb::
+// namespace with region so that ADL allows for construction of expressions
+// with regions without having to namespace qualify these operations.
 
 region intersect(region l, region r) {
     return region{reg::reg_and(std::move(l), std::move(r))};
@@ -317,8 +714,38 @@ region join(region l, region r) {
     return region{reg::reg_or(std::move(l), std::move(r))};
 }
 
+region complement(region r) {
+    return region{reg::reg_not(std::move(r))};
+}
+
+region difference(region l, region r) {
+    return region{reg::reg_minus(std::move(l), std::move(r))};
+}
+
 region::region() {
     *this = reg::nil();
+}
+
+// Implicit constructors/converters.
+
+region::region(std::string label) {
+    *this = reg::named(std::move(label));
+}
+
+region::region(const char* label) {
+    *this = reg::named(label);
+}
+
+region::region(mcable c) {
+    *this = reg::cable(c.branch, c.prox_pos, c.dist_pos);
+}
+
+region::region(mcable_list cl) {
+    *this = reg::cable_list(std::move(cl));
+}
+
+region::region(mextent x) {
+    *this = reg::extent(std::move(x));
 }
 
 } // namespace arb

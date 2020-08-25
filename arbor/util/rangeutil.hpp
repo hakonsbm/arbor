@@ -193,6 +193,17 @@ bool any_of(const Seq& seq, const Predicate& pred) {
     return std::any_of(canon.begin(), canon.end(), pred);
 }
 
+// Accumulate over range
+
+template <
+    typename Seq,
+    typename Value = typename util::sequence_traits<Seq>::value_type
+>
+Value sum(const Seq& seq, Value base = Value{}) {
+    auto canon = canonical_view(seq);
+    return std::accumulate(canon.begin(), canon.end(), base);
+}
+
 // Accumulate by projection `proj`
 
 template <
@@ -294,6 +305,31 @@ bool is_sorted(const Seq& seq) {
     return std::is_sorted(canon.begin(), canon.end());
 }
 
+// Range version of std::equal.
+
+template <
+    typename Seq1, typename Seq2,
+    typename Eq = std::equal_to<void>,
+    typename = util::enable_if_sequence_t<const Seq1&>,
+    typename = util::enable_if_sequence_t<const Seq2&>
+>
+bool equal(const Seq1& seq1, const Seq2& seq2, Eq p = Eq{}) {
+    using std::begin;
+    using std::end;
+
+    auto i1 = begin(seq1);
+    auto e1 = end(seq1);
+
+    auto i2 = begin(seq2);
+    auto e2 = end(seq2);
+
+    while (i1!=e1 && i2!=e2) {
+        if (!p(*i1, *i2)) return false;
+        ++i1;
+        ++i2;
+    }
+    return i1==e1 && i2==e2;
+}
 
 // Test if sequence is sorted after apply projection `proj` to elements.
 // (TODO: this will perform unnecessary copies if `proj` returns a reference;
@@ -362,6 +398,39 @@ range<Rev, Rev> reverse_view(Seq&& seq) {
     auto strict = strict_view(seq);
     return range<Rev, Rev>(Rev(strict.right), Rev(strict.left));
 }
+
+// Left fold (accumulate) over sequence.
+//
+// Note that the order of arguments follows the application order;
+// schematically:
+//
+//     foldl f a [] = a
+//     foldl f a (b:bs) = foldl f (f a b) bs
+//
+// The binary operator f will be invoked once per element in the
+// sequence in turn, with the running accumulator as the first
+// argument. If the iterators for the sequence deference to a
+// mutable lvalue, then mutation of the value in the input sequence
+// is explicitly permitted.
+//
+// std::accumulate(begin, end, init, f) is equivalent to
+// util::foldl(f, init, util::make_range(begin, end)).
+
+template <typename Seq, typename Acc, typename BinOp>
+auto foldl(BinOp f, Acc a, Seq&& seq) {
+    using std::begin;
+    using std::end;
+
+    auto b = begin(seq);
+    auto e = end(seq);
+
+    while (b!=e) {
+        a = f(std::move(a), *b);
+        ++b;
+    }
+    return a;
+}
+
 
 } // namespace util
 } // namespace arb

@@ -13,16 +13,15 @@
 
 namespace arb {
 
-// Forward declare the backend em_morphology type, required for defining the
-// interface for concretising locsets.
-class em_morphology;
+struct mprovider;
 
 class locset;
+class locset_tag {};
 
 class locset {
 public:
     template <typename Impl,
-              typename X=std::enable_if_t<!std::is_same<std::decay_t<Impl>, locset>::value>>
+              typename = std::enable_if_t<std::is_base_of<locset_tag, std::decay_t<Impl>>::value>>
     explicit locset(Impl&& impl):
         impl_(new wrap<Impl>(std::forward<Impl>(impl))) {}
 
@@ -35,6 +34,8 @@ public:
     locset(const locset& other):
         impl_(other.impl_->clone()) {}
 
+    locset& operator=(locset&& other) = default;
+
     locset& operator=(const locset& other) {
         impl_ = other.impl_->clone();
         return *this;
@@ -43,23 +44,22 @@ public:
     // The default constructor creates an empty "nil" set.
     locset();
 
-    // Construct an explicit location set with a single location.
+    // Implicity convert mlocation and mlocation_lists to locsets.
     locset(mlocation other);
+    locset(mlocation_list other);
+
+    // Implicitly convert string to named locset expression.
+    locset(std::string label);
+    locset(const char* label);
 
     template <typename Impl,
-              typename X=std::enable_if_t<!std::is_same<std::decay_t<Impl>, locset>::value>>
+              typename = std::enable_if_t<std::is_base_of<locset_tag, std::decay_t<Impl>>::value>>
     locset& operator=(Impl&& other) {
         impl_ = new wrap<Impl>(std::forward<Impl>(other));
         return *this;
     }
 
-    template <typename Impl>
-    locset& operator=(const Impl& other) {
-        impl_ = new wrap<Impl>(other);
-        return *this;
-    }
-
-    friend mlocation_list thingify(const locset& p, const em_morphology& m) {
+    friend mlocation_list thingify(const locset& p, const mprovider& m) {
         return p.impl_->thingify(m);
     }
 
@@ -88,7 +88,7 @@ private:
         virtual ~interface() {}
         virtual std::unique_ptr<interface> clone() = 0;
         virtual std::ostream& print(std::ostream&) = 0;
-        virtual mlocation_list thingify(const em_morphology&) = 0;
+        virtual mlocation_list thingify(const mprovider&) = 0;
     };
 
     std::unique_ptr<interface> impl_;
@@ -102,7 +102,7 @@ private:
             return std::unique_ptr<interface>(new wrap<Impl>(wrapped));
         }
 
-        virtual mlocation_list thingify(const em_morphology& m) override {
+        virtual mlocation_list thingify(const mprovider& m) override {
             return thingify_(wrapped, m);
         }
 
@@ -114,13 +114,12 @@ private:
     };
 };
 
+class region;
+
 namespace ls {
 
-// Location of a sample.
-locset location(mlocation);
-
-// Location of a sample.
-locset sample(msize_t);
+// Explicit location on morphology.
+locset location(msize_t branch, double pos);
 
 // Set of terminal nodes on a morphology.
 locset terminal();
@@ -128,9 +127,47 @@ locset terminal();
 // The root node of a morphology.
 locset root();
 
+// Named locset.
+locset named(std::string);
+
 // The null (empty) set.
 locset nil();
 
+// Most distal points of a region.
+locset most_distal(region reg);
+
+// Most proximal points of a region.
+locset most_proximal(region reg);
+
+// Boundary points of a region.
+locset boundary(region reg);
+
+// Completed boundary points of a region.
+// (Boundary of completed components.)
+locset cboundary(region reg);
+
+// Returns all locations in a locset that are also in the region.
+locset restrict(locset ls, region reg);
+
+// Returns locations that mark the segments.
+locset segment_boundaries();
+
+// A range `left` to `right` of randomly selected locations with a
+// uniform distribution from region `reg` generated using `seed`
+locset uniform(region reg, unsigned left, unsigned right, uint64_t seed);
+
+// Proportional location on every branch.
+locset on_branches(double pos);
+
+// Support of a locset (x s.t. x in locset).
+locset support(locset);
+
 } // namespace ls
+
+// Union of two locsets.
+locset join(locset, locset);
+
+// Multiset sum of two locsets.
+locset sum(locset, locset);
 
 } // namespace arb

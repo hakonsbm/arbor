@@ -16,7 +16,8 @@ enum class moduleKind {
 enum class accessKind {
     read,
     write,
-    readwrite
+    readwrite,
+    noaccess
 };
 
 /// describes the scope of a variable
@@ -45,6 +46,7 @@ enum class sourceKind {
     conductivity,
     conductance,
     dt,
+    time,
     ion_current,
     ion_current_density,
     ion_revpot,

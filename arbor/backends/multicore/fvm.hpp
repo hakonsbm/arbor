@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include <arbor/mechanism.hpp>
+
 #include "backends/event.hpp"
 #include "backends/multicore/matrix_state.hpp"
 #include "backends/multicore/multi_event_stream.hpp"
@@ -43,6 +45,7 @@ struct backend {
     using sample_event_stream = arb::multicore::sample_event_stream;
 
     using shared_state = arb::multicore::shared_state;
+    using ion_state = arb::multicore::ion_state;
 
     static threshold_watcher voltage_watcher(
         const shared_state& state,
@@ -59,6 +62,8 @@ struct backend {
             thresholds,
             context);
     }
+
+    static fvm_value_type* mechanism_field_data(arb::mechanism* mptr, const std::string& field);
 };
 
 } // namespace multicore

@@ -1,20 +1,22 @@
-# Arbor Library
+[![CI status](https://gitlab.com/cscs-ci/arbor-sim/arbor/badges/master/pipeline.svg)](https://gitlab.com/cscs-ci/arbor-sim/arbor/-/commits/master) [![Build Status](https://travis-ci.org/arbor-sim/arbor.svg?branch=master)](https://travis-ci.org/arbor-sim/arbor) [![codecov](https://codecov.io/gl/cscs-ci:arbor-sim/arbor/branch/master/graph/badge.svg)](https://codecov.io/gl/cscs-ci:arbor-sim/arbor) [![Gitpod Ready-to-Code](https://img.shields.io/badge/Gitpod-Ready--to--Code-blue?logo=gitpod)](https://gitpod.io/#https://github.com/arbor-sim/arbor) 
 
-[![Build Status](https://travis-ci.org/arbor-sim/arbor.svg?branch=master)](https://travis-ci.org/arbor-sim/arbor)
+# Arbor Library
 
 Arbor is a library for implementing performance portable network simulations of multi-compartment neuron models.
 
 An installation guide and library documentation are available online at [Read the Docs](http://arbor.readthedocs.io/en/latest/).
 
-[Submit a ticket](https://github.com/arbor-sim/arbor) if you have any questions or want help.
+[Submit a ticket or start a discussion](https://github.com/arbor-sim/arbor) if you have any questions or want help.
 
 ### Citing Arbor
 
-It is possible to cite specific versions of Arbor used to run a simulation via Zenodo:
+The Arbor software can be cited via Zenodo: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1459678.svg)](https://doi.org/10.5281/zenodo.1459678).
+
+Previous versions of Arbor can be cited specifically:
 * Version 0.2: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.2583709.svg)](https://doi.org/10.5281/zenodo.2583709)
 * Version 0.1: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1459679.svg)](https://doi.org/10.5281/zenodo.1459679)
 
-The following BibTeX can be used to cite Arbor:
+The following BibTeX entry can be used to cite Arbor:
 
 ```
 @INPROCEEDINGS{

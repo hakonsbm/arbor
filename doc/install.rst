@@ -3,8 +3,10 @@
 Installing Arbor
 ################
 
-Arbor is installed by obtaining the source code and compiling it on
-the target system.
+.. Note::
+    If you want to get started quickly experimenting with Arbor via its Python wrapper, see the Python installation guide at :doc:`/python`.
+
+This guide covers installing Arbor using CMake, which is the recommended method for configuring Arbor for HPC applications and developers.
 
 This guide starts with an overview of the building process, and the various options
 available to customize the build.
@@ -28,11 +30,11 @@ with very few tools.
     Tool        Notes
     =========== ============================================
     Git         To check out the code, minimum version 2.0.
-    CMake       To set up the build, minimum version 3.9
-    compiler    A C++14 compiler. See `compilers <compilers_>`_.
+    CMake       To set up the build, minimum version 3.12.
+    compiler    A C++14 compiler. See `compilers <install-compilers_>`_.
     =========== ============================================
 
-.. _compilers:
+.. _install-compilers:
 
 Compilers
 ~~~~~~~~~
@@ -48,6 +50,7 @@ We recommend using GCC or Clang, for which Arbor has been tested and optimised.
     GCC         6.1.0
     Clang       4.0          Needs GCC 6 or later for standard library.
     Apple Clang 9            Apple LLVM version 9.0.0 (clang-900.0.39.2)
+    Hip Clang                Unofficial Release
     =========== ============ ============================================
 
 .. _note_CC:
@@ -106,6 +109,7 @@ GPU Support
 ~~~~~~~~~~~
 
 Arbor has full support for NVIDIA GPUs, for which the NVIDIA CUDA toolkit version 9 is required.
+And experimental support for AMD GPUs when compiled with hip-clang (non-release compiler).
 
 Distributed
 ~~~~~~~~~~~
@@ -117,10 +121,11 @@ More information on building with MPI is in the `HPC cluster section <cluster_>`
 Python
 ~~~~~~
 
-Arbor has a Python frontend, for which Python 3.6 is required.
+Arbor has a Python frontend, for which a minimum of Python 3.6 is required.
 In order to use MPI in combination with the python frontend the
 `mpi4py <https://mpi4py.readthedocs.io/en/stable/install.html#>`_
-Python package is recommended.
+Python package is recommended. See :ref:`install-python` for more information.
+
 
 Documentation
 ~~~~~~~~~~~~~~
@@ -128,7 +133,7 @@ Documentation
 To build a local copy of the html documentation that you are reading now, you will need to
 install `Sphinx <http://www.sphinx-doc.org/en/master/>`_.
 
-.. _downloading:
+.. _install-downloading:
 
 Getting the Code
 ================
@@ -216,13 +221,13 @@ CMake parameters and flags, follow links to the more detailed descriptions below
         cmake -DARB_WITH_ASSERTIONS=ON -DCMAKE_BUILD_TYPE=debug
 
 .. topic:: `Release <buildtarget_>`_ mode (compiler optimizations enabled) with the default
-           compiler, optimized for the local `system architecture <architecture_>`_.
+           compiler, optimized for the local `system architecture <install-architecture_>`_.
 
     .. code-block:: bash
 
         cmake -DARB_ARCH=native
 
-.. topic:: `Release <buildtarget_>`_ mode with `Clang <compilers_>`_.
+.. topic:: `Release <buildtarget_>`_ mode with `Clang <install-compilers_>`_.
 
     .. code-block:: bash
 
@@ -230,21 +235,30 @@ CMake parameters and flags, follow links to the more detailed descriptions below
         export CXX=`which clang++`
         cmake
 
-.. topic:: `Release <buildtarget_>`_ mode for the `Haswell architecture <architecture_>`_ and `explicit vectorization <vectorize_>`_ of kernels.
+.. topic:: `Release <buildtarget_>`_ mode for the `Haswell architecture <install-architecture_>`_ and `explicit vectorization <install-vectorize_>`_ of kernels.
 
     .. code-block:: bash
 
         cmake -DARB_VECTORIZE=ON -DARB_ARCH=haswell
 
-.. topic:: `Release <buildtarget_>`_ mode with `explicit vectorization <vectorize_>`_, targeting the `Broadwell architecture <vectorize_>`_, with support for `P100 GPUs <gpu_>`_, and building with `GCC 6 <compilers_>`_.
+.. topic:: `Release <buildtarget_>`_ mode with `explicit vectorization <install-vectorize_>`_, targeting the `Broadwell architecture <install-vectorize_>`_, with support for `Nvidia GPUs <install-gpu_>`_, and building with `GCC 6 <install-compilers_>`_.
 
     .. code-block:: bash
 
         export CC=gcc-6
         export CXX=g++-6
-        cmake -DARB_VECTORIZE=ON -DARB_ARCH=broadwell -DARB_WITH_GPU=ON
+        cmake -DARB_VECTORIZE=ON -DARB_ARCH=broadwell -DARB_GPU=cuda
 
-.. topic:: `Release <buildtarget_>`_ mode with `explicit vectorization <vectorize_>`_, optimized for the `local system architecture <architecture_>`_ and `install <install_>`_ in ``/opt/arbor``
+.. topic:: `Release <buildtarget_>`_ mode with `explicit vectorization <install-vectorize_>`_, targeting the `Broadwell architecture <install-vectorize_>`_, with support for `AMD GPUs <install-gpu_>`_, and building with `hipcc <install-compilers_>`_.
+
+    .. code-block:: bash
+
+        export CC=clang
+        export CXX=hipcc
+        cmake -DARB_VECTORIZE=ON -DARB_ARCH=broadwell -DARB_GPU=hip
+
+
+.. topic:: `Release <buildtarget_>`_ mode with `explicit vectorization <install-vectorize_>`_, optimized for the `local system architecture <install-architecture_>`_ and `install <install_>`_ in ``/opt/arbor``
 
     .. code-block:: bash
 
@@ -263,7 +277,7 @@ with ``-g -O0`` flags), use the ``CMAKE_BUILD_TYPE`` CMake parameter.
 
     cmake -DCMAKE_BUILD_TYPE={debug,release}
 
-..  _architecture:
+..  _install-architecture:
 
 Architecture
 ------------
@@ -305,7 +319,7 @@ and `ARM options <https://gcc.gnu.org/onlinedocs/gcc/ARM-Options.html>`_.
      # IBM Power8
      cmake -DARB_ARCH=power8
 
-..  _vectorize:
+..  _install-vectorize:
 
 Vectorization
 -------------
@@ -323,36 +337,66 @@ With this flag set, the library will use architecture-specific vectorization int
 to implement these kernels. Arbor currently has vectorization support for x86 architectures
 with AVX, AVX2 or AVX512 ISA extensions, and for ARM architectures with support for AArch64 NEON intrinsics (first available on ARMv8-A).
 
-.. _gpu:
+.. _install-gpu:
 
 GPU Backend
 -----------
+Compiling for the GPU backend is controlled by the ``ARB_GPU`` CMake option which is used to select between NVIDIA and AMD GPUs
+as well as specify the chosen GPU compiler.
 
-Arbor supports NVIDIA GPUs using CUDA. The CUDA back end is enabled by setting the
-CMake ``ARB_WITH_GPU`` option.
+* ``none``: The default option. Disables the GPU backend.
+* ``cuda``: Enables the GPU backend for NVIDIA GPUs and compiles Arbor with nvcc (CUDA files), and the default C++ compiler (C++ files).
+* ``cuda-clang``: Enables the GPU backend for NVIDIA GPUs and compiles Arbor with clang.
+* ``hip``: Enables the experimental GPU backend for AMD GPUs and compiles Arbor with hipcc.
+
+**NVIDIA GPUs**:
+
+Arbor supports NVIDIA GPUs using CUDA. Compiling Arbor for NVIDIA GPUs requires the CUDA Toolkit.
 
 .. code-block:: bash
 
-    cmake -DARB_WITH_GPU=ON
+    cmake -DARB_GPU=cuda
 
-By default ``ARB_WITH_GPU=OFF``. When the option is turned on, Arbor is built for all
-supported GPUs and the available GPU will be used at runtime.
+.. code-block:: bash
+
+    cmake -DARB_GPU=cuda-clang
+
+Arbor is built for all supported NVIDIA GPUs and the available GPU will be used at runtime.
 
 Depending on the configuration of the system where Arbor is being built, the
-C++ compiler may not be able to find the ``cuda.h`` header. The easiest workaround
-is to add the path to the include directory containing the header to the
+C++ compiler may not be able to find the ``cuda.h`` header when building for NIDIA GPUs.
+The easiest workaround is to add the path to the include directory containing the header to the
 ``CPATH`` environment variable before configuring and building Arbor, for
 example:
 
 .. code-block:: bash
 
     export CPATH="/opt/cuda/include:$CPATH"
-    cmake -DARB_WITH_GPU=ON
+    cmake -DARB_GPU=cuda
 
+
+**HIP GPUs**:
+
+Arbor has experimental support for AMD GPUs using HIP. The only compiler currently supported is the non-release hip-clang (``hipcc``) compiler.
+(For instructions on how to build hipcc, refer to the
+`HIP documentation <https://github.com/ROCm-Developer-Tools/HIP/blob/master/INSTALL.md#hip-clang>`_).
+
+*CMake configuration for compiling Arbor with hipcc (CUDA and C++ files):*
+
+.. code-block:: bash
+
+    export CC=clang
+    export CXX=hipcc
+    cmake -DARB_GPU=hip
+
+Arbor is built for all supported AMD GPUs and the available GPU will be used at runtime.
 
 .. Note::
     Arbor supports and has been tested on the Kepler (K20 & K80), Pascal (P100) and Volta (V100) GPUs
+    as well as Vega10 and Vega20 GPUs
 
+
+.. _install-python:
 
 Python Frontend
 ----------------
@@ -362,13 +406,46 @@ CMake ``ARB_WITH_PYTHON`` option:
 
 .. code-block:: bash
 
-    cmake -ARB_WITH_PYTHON=ON
+    cmake -DARB_WITH_PYTHON=ON
 
-By default ``ARB_WITH_PYTHON=OFF``. When this option is turned on, a python module called :py:mod:`arbor` is built.
+By default ``ARB_WITH_PYTHON=OFF``. When this option is turned on, a Python module called :py:mod:`arbor` is built.
 
-The Arbor Python wrapper has optional support for the ``mpi4py`` Python module
-for MPI. CMake will attempt to automatically detect ``mpi4py`` if configured
-with both ``-ARB_WITH_PYTHON=ON`` and MPI ``-DARB_WITH_MPI=ON``.
+A specific version of Python can be set when configuring with CMake using the
+``PYTHON_EXECUTABLE`` variable. For example, to use Python 3.7 installed on a Linux
+system with the executable in ``/usr/bin/python3.7``:
+
+.. code-block:: bash
+
+    cmake .. -DARB_WITH_PYTHON=ON -DPYTHON_EXECUTABLE=/usr/bin/python3.7
+
+By default the Python module will be installed in the standard ``CMAKE_INSTALL_PREFIX``
+location. To install the module in a different location, for example as a
+user module or in a virtual environment, set ``ARB_PYTHON_PREFIX``.
+For example, the CMake configuration for targetting Python 3.8 and install as a
+user site package might look like the following:
+
+.. code-block:: bash
+
+    cmake .. -DARB_WITH_PYTHON=ON                   \
+             -DARB_PYTHON_PREFIX=${HOME}/.local     \
+             -DPYTHON_EXECUTABLE=/user/bin/python3.8
+
+On the target LINUX system, the Arbor package was installed in
+``/home/$USER/.local/lib/python3.8/site-packages``.
+
+.. Note::
+    By default CMake sets ``CMAKE_INSTALL_PREFIX`` to ``/usr/local`` on Linux and OS X.
+    The compiled libraries are installed in ``/usr/local/lib``, headers are installed in
+    ``/usr/local/include``, and the Python module will be installed in a path like
+    ``/usr/local/lib/python3.7/site-packages``.
+    Because ``/usr/local`` is a system path, the installation phase needs to be run as root,
+    i.e. ``sudo make install``, even if ``ARB_PYTHON_PREFIX`` is set to a user path
+    that does not require root to install.
+
+The Arbor Python wrapper has optional support for the mpi4py, though
+it is not required to use Arbor with Python and MPI.
+CMake will attempt to automatically detect ``mpi4py`` if configured
+with both ``-DARB_WITH_PYTHON=ON`` and MPI ``-DARB_WITH_MPI=ON``.
 If CMake fails to find ``mpi4py`` when it should, the easiest workaround is to
 add the path to the include directory for ``mpi4py`` to the ``CPATH`` environment
 variable before configuring and building Arbor:
@@ -384,7 +461,7 @@ variable before configuring and building Arbor:
     # set CPATH and run cmake
     export CPATH="/path/to/python3/site-packages/mpi4py/include/:$CPATH"
 
-    cmake -ARB_WITH_PYTHON=ON -DARB_WITH_MPI=ON
+    cmake -DARB_WITH_PYTHON=ON -DARB_WITH_MPI=ON
 
 .. _install:
 
@@ -424,6 +501,8 @@ software, so we cover some common issues in this section.  If you have problems
 on your target system that are not covered here, please make an issue on the
 Arbor `Github issues <https://github.com/arbor-sim/arbor/issues>`_ page.
 We will do our best to help you directly, and update this guide to help other users.
+
+.. _install-mpi:
 
 MPI
 ---
@@ -516,7 +595,7 @@ Putting it all together, a typical workflow to build Arbor on a Cray system is:
 
     export CRAYPE_LINK_TYPE=dynamic
     module swap PrgEnv-cray PrgEnv-gnu
-    moudle swap gcc/7.1.0
+    module swap gcc/7.1.0
     export CC=`which cc`; export CXX=`which CC`;
     cmake -DARB_WITH_MPI=ON    # MPI support
 
@@ -694,7 +773,7 @@ CMake Git Submodule Warnings
 ----------------------------
 
 When running CMake, warnings like the following indicate that the Git submodules
-need to be `updated <downloading_>`_.
+need to be `updated <install-downloading_>`_.
 
 .. code-block:: none
 

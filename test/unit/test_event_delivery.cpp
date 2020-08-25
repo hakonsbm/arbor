@@ -6,10 +6,11 @@
 // * Inject events one per cell in a given order, and confirm generated spikes
 //   are in the same order.
 
+#include <arbor/cable_cell.hpp>
 #include <arbor/common_types.hpp>
 #include <arbor/domain_decomposition.hpp>
+#include <arbor/morph/segment_tree.hpp>
 #include <arbor/simulation.hpp>
-#include <arbor/cable_cell.hpp>
 #include <arbor/spike.hpp>
 #include <arbor/spike_event.hpp>
 
@@ -27,13 +28,13 @@ struct test_recipe: public n_cable_cell_recipe {
     explicit test_recipe(int n): n_cable_cell_recipe(n, test_cell()) {}
 
     static cable_cell test_cell() {
-        sample_tree st;
-        st.append({0,0,0,10,1});
+        segment_tree st;
+        st.append(mnpos, {0,0, 0,10}, {0,0,20,10}, 1);
 
         label_dict d;
         d.set("soma", arb::reg::tagged(1));
 
-        cable_cell c(st, d, true);
+        cable_cell c(st, d);
         c.place(mlocation{0, 0.5}, "expsyn");
         c.place(mlocation{0, 0.5}, threshold_detector{-64});
         c.place(mlocation{0, 0.5}, gap_junction_site{});

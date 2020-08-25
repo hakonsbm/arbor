@@ -13,14 +13,13 @@
 
 namespace arb {
 
-// Forward declare the backend em_morphology type, required for defining the
-// interface for concretising locsets.
-class em_morphology;
+struct mprovider;
+struct region_tag {};
 
 class region {
 public:
     template <typename Impl,
-              typename X=std::enable_if_t<!std::is_same<std::decay_t<Impl>, region>::value>>
+              typename = std::enable_if_t<std::is_base_of<region_tag, std::decay_t<Impl>>::value>>
     explicit region(Impl&& impl):
         impl_(new wrap<Impl>(std::forward<Impl>(impl))) {}
 
@@ -42,7 +41,7 @@ public:
     }
 
     template <typename Impl,
-              typename X=std::enable_if_t<!std::is_same<std::decay_t<Impl>, region>::value>>
+              typename = std::enable_if_t<std::is_base_of<region_tag, std::decay_t<Impl>>::value>>
     region& operator=(Impl&& other) {
         impl_ = new wrap<Impl>(std::forward<Impl>(other));
         return *this;
@@ -54,7 +53,16 @@ public:
         return *this;
     }
 
-    friend mcable_list thingify(const region& r, const em_morphology& m) {
+    // Implicit conversion from mcable, mcable_list, or mextent.
+    region(mcable);
+    region(mextent);
+    region(mcable_list);
+
+    // Implicitly convert string to named region expression.
+    region(std::string label);
+    region(const char* label);
+
+    friend mextent thingify(const region& r, const mprovider& m) {
         return r.impl_->thingify(m);
     }
 
@@ -83,7 +91,7 @@ private:
         virtual ~interface() {}
         virtual std::unique_ptr<interface> clone() = 0;
         virtual std::ostream& print(std::ostream&) = 0;
-        virtual mcable_list thingify(const em_morphology&) = 0;
+        virtual mextent thingify(const mprovider&) = 0;
     };
 
     std::unique_ptr<interface> impl_;
@@ -97,7 +105,7 @@ private:
             return std::unique_ptr<interface>(new wrap<Impl>(wrapped));
         }
 
-        virtual mcable_list thingify(const em_morphology& m) override {
+        virtual mextent thingify(const mprovider& m) override {
             return thingify_(wrapped, m);
         }
 
@@ -109,15 +117,15 @@ private:
     };
 };
 
+class locset;
+
 namespace reg {
 
 // An empty region.
 region nil();
 
 // An explicit cable section.
-region cable(mcable);
-
-region interval(mlocation, mlocation);
+region cable(msize_t, double, double);
 
 // An explicit branch.
 region branch(msize_t);
@@ -125,9 +133,50 @@ region branch(msize_t);
 // Region with all segments with segment tag id.
 region tagged(int id);
 
+// Region with all segments distal from another region
+region distal_interval(locset start, double distance);
+
+// Region with all segments proximal from another region
+region proximal_interval(locset end, double distance);
+
+// Region with all segments with radius less than/less than or equal to r
+region radius_lt(region reg, double r);
+region radius_le(region reg, double r);
+
+// Region with all segments with radius greater than/greater than or equal to r
+region radius_gt(region reg, double r);
+region radius_ge(region reg, double r);
+
+// Region with all segments with projection less than/less than or equal to r
+region z_dist_from_root_lt(double r);
+region z_dist_from_root_le(double r);
+
+// Region with all segments with projection greater than/greater than or equal to r
+region z_dist_from_root_gt(double r);
+region z_dist_from_root_ge(double r);
+
 // Region with all segments in a cell.
 region all();
 
+// Region including all covers of included fork points.
+// (Pre-image of projection onto the topological tree.)
+region complete(region);
+
+// Region associated with a name.
+region named(std::string);
+
 } // namespace reg
+
+// Union of two regions.
+region join(region, region);
+
+// Intersection of two regions.
+region intersect(region, region);
+
+// Closed complement of a region.
+region complement(region);
+
+// (Closure of) set difference of two regions.
+region difference(region a, region b);
 
 } // namespace arb

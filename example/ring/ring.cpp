@@ -3,6 +3,7 @@
  *
  */
 
+#include <cassert>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -42,7 +43,7 @@ struct ring_params {
     std::string name = "default";
     unsigned num_cells = 10;
     double min_delay = 10;
-    double duration = 100;
+    double duration = 200;
     cell_parameters cell;
 };
 
@@ -53,7 +54,6 @@ using arb::cell_size_type;
 using arb::cell_member_type;
 using arb::cell_kind;
 using arb::time_type;
-using arb::cell_probe_address;
 
 // Writes voltage trace as a json file.
 void write_trace_json(const arb::trace_data<double>& trace);
@@ -109,18 +109,10 @@ public:
         return gens;
     }
 
-    // There is one probe (for measuring voltage at the soma) on the cell.
-    cell_size_type num_probes(cell_gid_type gid)  const override {
-        return 1;
-    }
-
-    arb::probe_info get_probe(cell_member_type id) const override {
-        // Get the appropriate kind for measuring voltage.
-        cell_probe_address::probe_kind kind = cell_probe_address::membrane_voltage;
-        // Measure at the soma.
+    std::vector<arb::probe_info> get_probes(cell_gid_type gid) const override {
+        // Measure membrane voltage at end of soma.
         arb::mlocation loc{0, 0.0};
-
-        return arb::probe_info{id, kind, cell_probe_address{loc, kind}};
+        return {arb::cable_probe_membrane_voltage{loc}};
     }
 
     arb::util::any get_global_properties(arb::cell_kind) const override {
@@ -134,48 +126,6 @@ private:
     double min_delay_;
     float event_weight_ = 0.05;
     arb::cable_cell_global_properties gprop_;
-};
-
-struct cell_stats {
-    using size_type = unsigned;
-    size_type ncells = 0;
-    size_type nsegs = 0;
-    size_type ncomp = 0;
-
-    cell_stats(arb::recipe& r) {
-#ifdef ARB_MPI_ENABLED
-        int nranks, rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-        ncells = r.num_cells();
-        size_type cells_per_rank = ncells/nranks;
-        size_type b = rank*cells_per_rank;
-        size_type e = (rank==nranks-1)? ncells: (rank+1)*cells_per_rank;
-        size_type nsegs_tmp = 0;
-        size_type ncomp_tmp = 0;
-        for (size_type i=b; i<e; ++i) {
-            auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-            nsegs_tmp += c.num_branches();
-            ncomp_tmp += c.num_compartments();
-        }
-        MPI_Allreduce(&nsegs_tmp, &nsegs, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&ncomp_tmp, &ncomp, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-#else
-        ncells = r.num_cells();
-        for (size_type i=0; i<ncells; ++i) {
-            auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-            nsegs += c.num_branches();
-            ncomp += c.num_compartments();
-        }
-#endif
-    }
-
-    friend std::ostream& operator<<(std::ostream& o, const cell_stats& s) {
-        return o << "cell stats: "
-                 << s.ncells << " cells; "
-                 << s.nsegs << " branches; "
-                 << s.ncomp << " compartments.";
-    }
 };
 
 int main(int argc, char** argv) {
@@ -219,8 +169,6 @@ int main(int argc, char** argv) {
 
         // Create an instance of our recipe.
         ring_recipe recipe(params.num_cells, params.cell, params.min_delay);
-        cell_stats stats(recipe);
-        std::cout << stats << "\n";
 
         auto decomp = arb::partition_load_balance(recipe, context);
 
@@ -232,9 +180,9 @@ int main(int argc, char** argv) {
         // The id of the only probe on the cell: the cell_member type points to (cell 0, probe 0)
         auto probe_id = cell_member_type{0, 0};
         // The schedule for sampling is 10 samples every 1 ms.
-        auto sched = arb::regular_schedule(0.1);
+        auto sched = arb::regular_schedule(1);
         // This is where the voltage samples will be stored as (time, value) pairs
-        arb::trace_data<double> voltage;
+        arb::trace_vector<double> voltage;
         // Now attach the sampler at probe_id, with sampling schedule sched, writing to voltage
         sim.add_sampler(arb::one_probe(probe_id), sched, arb::make_simple_sampler(voltage));
 
@@ -277,7 +225,12 @@ int main(int argc, char** argv) {
         }
 
         // Write the samples to a json file.
-        if (root) write_trace_json(voltage);
+        if (root) {
+            write_trace_json(voltage.at(0));
+        }
+
+        auto profile = arb::profile::profiler_summary();
+        std::cout << profile << "\n";
 
         auto report = arb::profile::make_meter_report(meters, context);
         std::cout << report;

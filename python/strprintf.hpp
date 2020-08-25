@@ -7,10 +7,13 @@
 #include <string>
 #include <sstream>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <arbor/util/optional.hpp>
+
+#include "s_expr.hpp"
 
 namespace pyarb {
 namespace util {
@@ -132,6 +135,25 @@ namespace impl {
         }
     };
 
+    template <typename Seq, typename F>
+    struct sepval_transform {
+        const Seq& seq_;
+        const char* sep_;
+        const F f_;
+
+        sepval_transform(const Seq& seq, const char* sep, F&& f): seq_(seq), sep_(sep), f_(std::forward(f)) {}
+
+        friend std::ostream& operator<<(std::ostream& o, const sepval_transform& s) {
+            bool first = true;
+            for (auto& x: s.seq_) {
+                if (!first) o << s.sep_;
+                first = false;
+                o << s.f(x);
+            }
+            return o;
+        }
+    };
+
     template <typename Seq>
     struct sepval_lim {
         const Seq& seq_;
@@ -179,12 +201,32 @@ impl::sepval_lim<Seq> csv(const Seq& seq, unsigned n) {
     return impl::sepval_lim<Seq>(seq, ", ", n);
 }
 
-} // namespace util
-
-template <typename T>
-std::ostream& operator<<(std::ostream& o, const arb::util::optional<T>& x) {
-    return o << (x? util::to_string(*x): "None");
+// Print dictionary: this could be done easily with range adaptors in C++17
+template <typename Key, typename T>
+std::string dictionary_csv(const std::unordered_map<Key, T>& dict) {
+    constexpr bool string_key   = std::is_same<std::string, std::decay_t<Key>>::value;
+    constexpr bool string_value = std::is_same<std::string, std::decay_t<T>>::value;
+    std::string format = pprintf("{}: {}", string_key? "\"{}\"": "{}", string_value? "\"{}\"": "{}");
+    std::string s = "{";
+    bool first = true;
+    for (auto& p: dict) {
+        if (!first) s += ", ";
+        first = false;
+        s += pprintf(format.c_str(), p.first, p.second);
+    }
+    s += "}";
+    return s;
 }
 
-} // namespace pyarb
+} // namespace util
 
+}
+
+namespace arb {
+namespace util {
+template <typename T>
+std::ostream& operator<<(std::ostream& o, const arb::util::optional<T>& x) {
+    return o << (x? pyarb::util::to_string(*x): "None");
+}
+}
+}

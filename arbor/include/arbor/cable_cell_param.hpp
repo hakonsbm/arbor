@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arbor/arbexcept.hpp>
+#include <arbor/cv_policy.hpp>
 #include <arbor/mechcat.hpp>
 #include <arbor/morph/locset.hpp>
 #include <arbor/util/optional.hpp>
@@ -16,6 +17,17 @@ namespace arb {
 struct cable_cell_error: arbor_exception {
     cable_cell_error(const std::string& what):
         arbor_exception("cable_cell: "+what) {}
+};
+
+// Ion inital concentration and reversal potential
+// parameters, as used in cable_cell_parameter_set,
+// and set locally via painting initial_ion_data
+// (see below).
+
+struct cable_cell_ion_data {
+    double init_int_concentration = NAN;
+    double init_ext_concentration = NAN;
+    double init_reversal_potential = NAN;
 };
 
 // Current clamp description for stimulus specification.
@@ -40,6 +52,25 @@ struct threshold_detector {
 
 // Tag type for dispatching cable_cell::place() calls that add gap junction sites.
 struct gap_junction_site {};
+
+// Setter types for painting physical and ion parameters or setting
+// cell-wide default:
+
+struct init_membrane_potential {
+    double value = NAN; // [mV]
+};
+
+struct temperature_K {
+    double value = NAN; // [K]
+};
+
+struct axial_resistivity {
+    double value = NAN; // [[Ω·cm]
+};
+
+struct membrane_capacitance {
+    double value = NAN; // [F/m²]
+};
 
 // Mechanism description, viz. mechanism name and
 // (non-global) parameter settings. Used to assign
@@ -104,177 +135,39 @@ private:
     std::unordered_map<std::string, double> param_;
 };
 
-// FVM discretization policies/hints.
-//
-// CV polices, given a cable cell, provide a locset comprising
-// CV boundary points to be used by the discretization. The
-// discretization need not adopt the boundary points 100% faithfully;
-// for example, it may elide empty CVs or perform other transformations
-// for numeric fidelity or performance reasons.
-//
-// The cv_policy class is a value-like wrapper for actual
-// policies that derive from `cv_policy_base`. At present,
-// there are only three policies implemented, described below.
-// The intent is to provide more sophisticated policies in the
-// near future, specifically one based on the 'd-lambda' rule.
-//
-//   cv_policy_explicit:
-//       Simply use the provided locset.
-//
-//   cv_policy_fixed_per_branch:
-//       Use the same number of CVs for each branch.
-//
-//   cv_policy_max_extent:
-//       Use as many CVs as required to ensure that no CV has
-//       a length longer than a given value.
-//
-// Except for the explicit policy, CV policies may also take various
-// flags (implemented as bitwise orable enums) to modify their
-// behaviour. In general, future CV policies may choose to ignore
-// flag values, but should respect them if their semantics are
-// relevant.
-//
-//   cv_policy_flag::interior_forks:
-//       Position CVs so as to include fork points, as opposed
-//       to positioning them so that fork points are at the
-//       boundaries of CVs.
-//
-//   cv_policy_flag::single_root_cv:
-//       Always treat the root branch as a single CV regardless.
-
-class cable_cell;
-
-struct cv_policy_base {
-    virtual locset cv_boundary_points(const cable_cell& cell) const = 0;
-    virtual std::unique_ptr<cv_policy_base> clone() const = 0;
-    virtual ~cv_policy_base() {}
+struct initial_ion_data {
+    std::string ion;
+    cable_cell_ion_data initial;
 };
 
-using cv_policy_base_ptr = std::unique_ptr<cv_policy_base>;
-
-struct cv_policy {
-    cv_policy(const cv_policy_base& ref) { // implicit
-        policy_ptr = ref.clone();
-    }
-
-    cv_policy(const cv_policy& other):
-        policy_ptr(other.policy_ptr->clone()) {}
-
-    cv_policy& operator=(const cv_policy& other) {
-        policy_ptr = other.policy_ptr->clone();
-        return *this;
-    }
-
-    cv_policy(cv_policy&&) = default;
-    cv_policy& operator=(cv_policy&&) = default;
-
-    locset cv_boundary_points(const cable_cell& cell) const {
-        return policy_ptr->cv_boundary_points(cell);
-    }
-
-private:
-    cv_policy_base_ptr policy_ptr;
+struct ion_reversal_potential_method {
+    std::string ion;
+    mechanism_desc method;
 };
-
-// Common flags for CV policies; bitwise composable.
-namespace cv_policy_flag {
-    using value = unsigned;
-    enum : unsigned {
-        none = 0,
-        interior_forks = 1<<0,
-        single_root_cv = 1<<1
-    };
-}
-
-struct cv_policy_explicit: cv_policy_base {
-    explicit cv_policy_explicit(locset locs): locs_(std::move(locs)) {}
-
-    cv_policy_base_ptr clone() const override {
-        return cv_policy_base_ptr(new cv_policy_explicit(*this));
-    }
-
-    locset cv_boundary_points(const cable_cell&) const override {
-        return locs_;
-    }
-
-private:
-    locset locs_;
-};
-
-struct cv_policy_max_extent: cv_policy_base {
-    explicit cv_policy_max_extent(double max_extent, cv_policy_flag::value flags = cv_policy_flag::none):
-         max_extent_(max_extent), flags_(flags) {}
-
-    cv_policy_base_ptr clone() const override {
-        return cv_policy_base_ptr(new cv_policy_max_extent(*this));
-    }
-
-    locset cv_boundary_points(const cable_cell&) const override;
-
-private:
-    double max_extent_;
-    cv_policy_flag::value flags_;
-};
-
-struct cv_policy_fixed_per_branch: cv_policy_base {
-    explicit cv_policy_fixed_per_branch(unsigned cv_per_branch, cv_policy_flag::value flags = cv_policy_flag::none):
-         cv_per_branch_(cv_per_branch), flags_(flags) {}
-
-    cv_policy_base_ptr clone() const override {
-        return cv_policy_base_ptr(new cv_policy_fixed_per_branch(*this));
-    }
-
-    locset cv_boundary_points(const cable_cell&) const override;
-
-private:
-    unsigned cv_per_branch_;
-    cv_policy_flag::value flags_;
-};
-
-inline cv_policy default_cv_policy() {
-    return cv_policy_fixed_per_branch(1);
-}
 
 // Cable cell ion and electrical defaults.
+
+// Parameters can be given as per-cell and global defaults via
+// cable_cell::default_parameters and cable_cell_global_properties::default_parameters
+// respectively.
 //
-// Parameters can be overridden with `cable_cell_local_parameter_set`
-// on unbranched segments within a cell; per-cell and global defaults
-// use `cable_cell_parameter_set`, which extends the parameter set
-// to supply per-cell or global ion reversal potential calculation
-// mechanisms.
+// With the exception of `reversal_potential_method`, these properties can
+// be set locally witihin a cell using the `cable_cell::paint()`, and the
+// cell defaults can be individually set with `cable_cell:set_default()`.
 
-struct cable_cell_ion_data {
-    double init_int_concentration = NAN;
-    double init_ext_concentration = NAN;
-    double init_reversal_potential = NAN;
-};
-
-struct cable_cell_local_parameter_set {
-    std::unordered_map<std::string, cable_cell_ion_data> ion_data;
+struct cable_cell_parameter_set {
     util::optional<double> init_membrane_potential; // [mV]
     util::optional<double> temperature_K;           // [K]
     util::optional<double> axial_resistivity;       // [Ω·cm]
     util::optional<double> membrane_capacitance;    // [F/m²]
-};
 
-struct cable_cell_parameter_set: public cable_cell_local_parameter_set {
+    std::unordered_map<std::string, cable_cell_ion_data> ion_data;
     std::unordered_map<std::string, mechanism_desc> reversal_potential_method;
-    cv_policy discretization = default_cv_policy();
 
-    // We'll need something like this until C++17, for sane initialization syntax.
-    cable_cell_parameter_set() = default;
-    cable_cell_parameter_set(
-        cable_cell_local_parameter_set p,
-        std::unordered_map<std::string, mechanism_desc> m = {},
-        cv_policy d = default_cv_policy()
-    ):
-        cable_cell_local_parameter_set(std::move(p)),
-        reversal_potential_method(std::move(m)),
-        discretization(std::move(d))
-    {}
+    util::optional<cv_policy> discretization;
 };
 
-extern cable_cell_local_parameter_set neuron_parameter_defaults;
+extern cable_cell_parameter_set neuron_parameter_defaults;
 
 // Global cable cell data.
 

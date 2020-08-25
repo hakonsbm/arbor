@@ -20,6 +20,9 @@
 #include <arbor/common_types.hpp>
 #include <arbor/cable_cell_param.hpp>
 #include <arbor/recipe.hpp>
+#include <arbor/util/any.hpp>
+#include <arbor/util/any_visitor.hpp>
+#include <arbor/util/optional.hpp>
 
 #include "builtin_mechanisms.hpp"
 #include "execution_context.hpp"
@@ -54,7 +57,7 @@ public:
         const recipe& rec,
         std::vector<fvm_index_type>& cell_to_intdom,
         std::vector<target_handle>& target_handles,
-        probe_association_map<probe_handle>& probe_map) override;
+        probe_association_map& probe_map) override;
 
     fvm_integration_result integrate(
         value_type tfinal,
@@ -66,7 +69,7 @@ public:
         const std::vector<cable_cell>& cells,
         const std::vector<cell_gid_type>& gids,
         const recipe& rec,
-        const fvm_discretization& D);
+        const fvm_cv_discretization& D);
 
     // Generates indom index for every gid, guarantees that gids belonging to the same supercell are in the same intdom
     // Fills cell_to_intdom map; returns number of intdoms
@@ -136,6 +139,17 @@ private:
     void set_gpu() {
         if (context_.gpu->has_gpu()) context_.gpu->set_gpu();
     }
+
+    // Translate cell probe descriptions into probe handles etc.
+    void resolve_probe_address(
+        std::vector<fvm_probe_data>& probe_data, // out parameter
+        const std::vector<cable_cell>& cells,
+        std::size_t cell_idx,
+        const util::any& paddr,
+        const fvm_cv_discretization& D,
+        const fvm_mechanism_data& M,
+        const std::vector<target_handle>& handles,
+        const std::unordered_map<std::string, mechanism*>& mech_instance_by_name);
 };
 
 template <typename Backend>
@@ -163,6 +177,18 @@ void fvm_lowered_cell_impl<Backend>::reset() {
     }
 
     update_ion_state();
+
+    state_->zero_currents();
+
+    // Note: mechanisms must be initialized again after the ion state is updated,
+    // as mechanisms can read/write the ion_state within the initialize block
+    for (auto& m: revpot_mechanisms_) {
+        m->initialize();
+    }
+
+    for (auto& m: mechanisms_) {
+        m->initialize();
+    }
 
     // NOTE: Threshold watcher reset must come after the voltage values are set,
     // as voltage is implicitly read by watcher to set initial state.
@@ -204,11 +230,9 @@ fvm_integration_result fvm_lowered_cell_impl<Backend>::integrate(
     while (remaining_steps) {
         // Update any required reversal potentials based on ionic concs.
 
-        PE(advance_update_revpot)
         for (auto& m: revpot_mechanisms_) {
             m->nrn_current();
         }
-        PL();
 
 
         // Deliver events and accumulate mechanism current contributions.
@@ -252,8 +276,7 @@ fvm_integration_result fvm_lowered_cell_impl<Backend>::integrate(
         matrix_.assemble(state_->dt_intdom, state_->voltage, state_->current_density, state_->conductivity);
         PL();
         PE(advance_integrate_matrix_solve);
-        matrix_.solve();
-        memory::copy(matrix_.solution(), state_->voltage);
+        matrix_.solve(state_->voltage);
         PL();
 
         // Integrate mechanism state.
@@ -272,7 +295,7 @@ fvm_integration_result fvm_lowered_cell_impl<Backend>::integrate(
 
         PE(advance_integrate_threshold);
         threshold_watcher_.test();
-        memory::copy(state_->time_to, state_->time);
+        std::swap(state_->time_to, state_->time);
         PL();
 
         // Check for non-physical solutions:
@@ -306,16 +329,16 @@ fvm_integration_result fvm_lowered_cell_impl<Backend>::integrate(
     };
 }
 
-template <typename B>
-void fvm_lowered_cell_impl<B>::update_ion_state() {
+template <typename Backend>
+void fvm_lowered_cell_impl<Backend>::update_ion_state() {
     state_->ions_init_concentration();
     for (auto& m: mechanisms_) {
         m->write_ions();
     }
 }
 
-template <typename B>
-void fvm_lowered_cell_impl<B>::assert_voltage_bounded(fvm_value_type bound) {
+template <typename Backend>
+void fvm_lowered_cell_impl<Backend>::assert_voltage_bounded(fvm_value_type bound) {
     auto v_minmax = state_->voltage_bounds();
     if (v_minmax.first>=-bound && v_minmax.second<=bound) {
         return;
@@ -327,13 +350,13 @@ void fvm_lowered_cell_impl<B>::assert_voltage_bounded(fvm_value_type bound) {
         v_minmax.first<-bound? v_minmax.first: v_minmax.second);
 }
 
-template <typename B>
-void fvm_lowered_cell_impl<B>::initialize(
+template <typename Backend>
+void fvm_lowered_cell_impl<Backend>::initialize(
     const std::vector<cell_gid_type>& gids,
     const recipe& rec,
     std::vector<fvm_index_type>& cell_to_intdom,
     std::vector<target_handle>& target_handles,
-    probe_association_map<probe_handle>& probe_map)
+    probe_association_map& probe_map)
 {
     using util::any_cast;
     using util::count_along;
@@ -346,15 +369,17 @@ void fvm_lowered_cell_impl<B>::initialize(
     std::vector<cable_cell> cells;
     const std::size_t ncell = gids.size();
 
-    cells.reserve(ncell);
-    for (auto gid: gids) {
-        try {
-            cells.push_back(any_cast<cable_cell>(rec.get_cell_description(gid)));
-        }
-        catch (util::bad_any_cast&) {
-            throw bad_cell_description(rec.get_cell_kind(gid), gid);
-        }
-    }
+    cells.resize(ncell);
+    threading::parallel_for::apply(0, gids.size(), context_.thread_pool.get(),
+           [&](cell_size_type i) {
+               auto gid = gids[i];
+               try {
+                   cells[i] = any_cast<cable_cell&&>(rec.get_cell_description(gid));
+               }
+               catch (util::bad_any_cast&) {
+                   throw bad_cell_description(rec.get_cell_kind(gid), gid);
+               }
+           });
 
     cable_cell_global_properties global_props;
     try {
@@ -387,19 +412,20 @@ void fvm_lowered_cell_impl<B>::initialize(
 
     // Discretize cells, build matrix.
 
-    fvm_discretization D = fvm_discretize(cells, global_props.default_parameters);
+    fvm_cv_discretization D = fvm_cv_discretize(cells, global_props.default_parameters, context_);
 
-    std::vector<index_type> cv_to_intdom(D.ncv);
-    std::transform(D.cv_to_cell.begin(), D.cv_to_cell.end(), cv_to_intdom.begin(),
+    std::vector<index_type> cv_to_intdom(D.size());
+    std::transform(D.geometry.cv_to_cell.begin(), D.geometry.cv_to_cell.end(), cv_to_intdom.begin(),
                    [&cell_to_intdom](index_type i){ return cell_to_intdom[i]; });
 
-    arb_assert(D.ncell == ncell);
-    matrix_ = matrix<backend>(D.parent_cv, D.cell_cv_bounds, D.cv_capacitance, D.face_conductance, D.cv_area, cell_to_intdom);
+    arb_assert(D.n_cell() == ncell);
+    matrix_ = matrix<backend>(D.geometry.cv_parent, D.geometry.cell_cv_divs,
+                              D.cv_capacitance, D.face_conductance, D.cv_area, cell_to_intdom);
     sample_events_ = sample_event_stream(num_intdoms);
 
     // Discretize mechanism data.
 
-    fvm_mechanism_data mech_data = fvm_build_mechanism_data(global_props,  cells, D);
+    fvm_mechanism_data mech_data = fvm_build_mechanism_data(global_props, cells, D, context_);
 
     // Discretize and build gap junction info.
 
@@ -422,14 +448,17 @@ void fvm_lowered_cell_impl<B>::initialize(
         const std::string& ion_name = i.first;
 
         if (auto charge = value_by_key(global_props.ion_species, ion_name)) {
-            state_->add_ion(ion_name, *charge, i.second.cv, i.second.init_iconc, i.second.init_econc, i.second.init_revpot);
+            state_->add_ion(ion_name, *charge, i.second);
         }
         else {
             throw cable_cell_error("unrecognized ion '"+ion_name+"' in mechanism");
         }
     }
 
-    target_handles.resize(mech_data.ntarget);
+    target_handles.resize(mech_data.n_target);
+
+    // Keep track of mechanisms by name for probe lookup.
+    std::unordered_map<std::string, mechanism*> mechptr_by_name;
 
     unsigned mech_id = 0;
     for (auto& m: mech_data.mechanisms) {
@@ -458,15 +487,16 @@ void fvm_lowered_cell_impl<B>::initialize(
                 layout.weight[i] = 1000/D.cv_area[cv];
 
                 // (builtin stimulus, for example, has no targets)
+                if (config.target.empty()) continue;
 
-                if (!config.target.empty()) {
-                    if(!config.multiplicity.empty()) {
-                        for (auto j: make_span(multiplicity_part[i])) {
-                            target_handles[config.target[j]] = target_handle(mech_id, i, cv_to_intdom[cv]);
-                        }
-                    } else {
-                        target_handles[config.target[i]] = target_handle(mech_id, i, cv_to_intdom[cv]);
-                    };
+                target_handle handle(mech_id, i, cv_to_intdom[cv]);
+                if (config.multiplicity.empty()) {
+                    target_handles[config.target[i]] = handle;
+                }
+                else {
+                    for (auto j: make_span(multiplicity_part[i])) {
+                        target_handles[config.target[j]] = handle;
+                    }
                 }
             }
             break;
@@ -485,6 +515,7 @@ void fvm_lowered_cell_impl<B>::initialize(
 
         auto minst = mech_instance(name);
         minst.mech->instantiate(mech_id++, *state_, minst.overrides, layout);
+        mechptr_by_name[name] = minst.mech.get();
 
         for (auto& pv: config.param_values) {
             minst.mech->set_parameter(pv.first, pv.second);
@@ -502,34 +533,30 @@ void fvm_lowered_cell_impl<B>::initialize(
 
     std::vector<index_type> detector_cv;
     std::vector<value_type> detector_threshold;
+    std::vector<fvm_probe_data> probe_data;
 
     for (auto cell_idx: make_span(ncell)) {
         cell_gid_type gid = gids[cell_idx];
 
-        for (auto detector: cells[cell_idx].detectors()) {
-            detector_cv.push_back(D.branch_location_cv(cell_idx, detector.location));
-            detector_threshold.push_back(detector.threshold);
+        for (auto entry: cells[cell_idx].detectors()) {
+            detector_cv.push_back(D.geometry.location_cv(cell_idx, entry.loc, cv_prefer::cv_empty));
+            detector_threshold.push_back(entry.item.threshold);
         }
 
-        for (cell_lid_type j: make_span(rec.num_probes(gid))) {
-            probe_info pi = rec.get_probe({gid, j});
-            auto where = any_cast<cell_probe_address>(pi.address);
+        std::vector<probe_info> rec_probes = rec.get_probes(gid);
+        for (cell_lid_type i: count_along(rec_probes)) {
+            probe_info& pi = rec_probes[i];
+            resolve_probe_address(probe_data, cells, cell_idx, std::move(pi.address),
+                D, mech_data, target_handles, mechptr_by_name);
 
-            auto cv = D.branch_location_cv(cell_idx, where.location);
-            probe_handle handle;
+            if (!probe_data.empty()) {
+                cell_member_type probe_id{gid, i};
+                probe_map.tag[probe_id] = pi.tag;
 
-            switch (where.kind) {
-            case cell_probe_address::membrane_voltage:
-                handle = state_->voltage.data()+cv;
-                break;
-            case cell_probe_address::membrane_current:
-                handle = state_->current_density.data()+cv;
-                break;
-            default:
-                throw arbor_internal_error("fvm_lowered_cell: unrecognized probeKind");
+                for (auto& data: probe_data) {
+                    probe_map.data.insert({probe_id, std::move(data)});
+                }
             }
-
-            probe_map.insert({pi.id, {handle, pi.tag}});
         }
     }
 
@@ -539,25 +566,24 @@ void fvm_lowered_cell_impl<B>::initialize(
 }
 
 // Get vector of gap_junctions
-template <typename B>
-std::vector<fvm_gap_junction> fvm_lowered_cell_impl<B>::fvm_gap_junctions(
+template <typename Backend>
+std::vector<fvm_gap_junction> fvm_lowered_cell_impl<Backend>::fvm_gap_junctions(
         const std::vector<cable_cell>& cells,
         const std::vector<cell_gid_type>& gids,
-        const recipe& rec, const fvm_discretization& D) {
+        const recipe& rec, const fvm_cv_discretization& D) {
 
     std::vector<fvm_gap_junction> v;
 
     std::unordered_map<cell_gid_type, std::vector<unsigned>> gid_to_cvs;
-    for (auto cell_idx: util::make_span(0, D.ncell)) {
+    for (auto cell_idx: util::make_span(0, D.n_cell())) {
+        if (!rec.num_gap_junction_sites(gids[cell_idx])) continue;
 
-        if (rec.num_gap_junction_sites(gids[cell_idx])) {
-            gid_to_cvs[gids[cell_idx]].reserve(rec.num_gap_junction_sites(gids[cell_idx]));
+        gid_to_cvs[gids[cell_idx]].reserve(rec.num_gap_junction_sites(gids[cell_idx]));
+        const auto& cell_gj = cells[cell_idx].gap_junction_sites();
 
-            auto cell_gj = cells[cell_idx].gap_junction_sites();
-            for (auto gj : cell_gj) {
-                auto cv = D.branch_location_cv(cell_idx, gj);
-                gid_to_cvs[gids[cell_idx]].push_back(cv);
-            }
+        for (auto gj : cell_gj) {
+            auto cv = D.geometry.location_cv(cell_idx, gj.loc, cv_prefer::cv_nonempty);
+            gid_to_cvs[gids[cell_idx]].push_back(cv);
         }
     }
 
@@ -585,8 +611,8 @@ std::vector<fvm_gap_junction> fvm_lowered_cell_impl<B>::fvm_gap_junctions(
     return v;
 }
 
-template <typename B>
-fvm_size_type fvm_lowered_cell_impl<B>::fvm_intdom(
+template <typename Backend>
+fvm_size_type fvm_lowered_cell_impl<Backend>::fvm_intdom(
         const recipe& rec,
         const std::vector<cell_gid_type>& gids,
         std::vector<fvm_index_type>& cell_to_intdom) {
@@ -633,6 +659,391 @@ fvm_size_type fvm_lowered_cell_impl<B>::fvm_intdom(
     }
 
     return intdom_id;
+}
+
+// Resolution of probe addresses into a specific fvm_probe_data draws upon data
+// from the cable cell, the discretization, the target handle map, and the
+// back-end shared state.
+//
+// `resolve_probe_address` collates this data into a `probe_resolution_data`
+// struct which is then passed on to the specific resolution procedure
+// determined by the type of the user-supplied probe address.
+
+template <typename Backend>
+struct probe_resolution_data {
+    std::vector<fvm_probe_data>& result;
+    typename Backend::shared_state* state;
+    const cable_cell& cell;
+    const std::size_t cell_idx;
+    const fvm_cv_discretization& D;
+    const fvm_mechanism_data& M;
+    const std::vector<target_handle>& handles;
+    const std::unordered_map<std::string, mechanism*>& mech_instance_by_name;
+
+    // Backend state data for a given mechanism and state variable.
+    const fvm_value_type* mechanism_state(const std::string& name, const std::string& state_var) const {
+        mechanism* m = util::value_by_key(mech_instance_by_name, name).value_or(nullptr);
+        if (!m) return nullptr;
+
+        const fvm_value_type* data = Backend::mechanism_field_data(m, state_var);
+        if (!data) throw cable_cell_error("no state variable '"+state_var+"' in mechanism '"+name+"'");
+
+        return data;
+    }
+
+    // Extent of density mechanism on cell.
+    mextent mechanism_support(const std::string& name) const {
+        auto& mech_map = cell.region_assignments().template get<mechanism_desc>();
+        auto opt_mm = util::value_by_key(mech_map, name);
+
+        return opt_mm? opt_mm->support(): mextent{};
+    };
+
+    // Index into ion data from location.
+    util::optional<fvm_index_type> ion_location_index(const std::string& ion, mlocation loc) const {
+        if (state->ion_data.count(ion)) {
+            return util::binary_search_index(M.ions.at(ion).cv,
+                fvm_index_type(D.geometry.location_cv(cell_idx, loc, cv_prefer::cv_nonempty)));
+        }
+        return util::nullopt;
+    }
+};
+
+template <typename Backend>
+void fvm_lowered_cell_impl<Backend>::resolve_probe_address(
+    std::vector<fvm_probe_data>& probe_data,
+    const std::vector<cable_cell>& cells,
+    std::size_t cell_idx,
+    const util::any& paddr,
+    const fvm_cv_discretization& D,
+    const fvm_mechanism_data& M,
+    const std::vector<target_handle>& handles,
+    const std::unordered_map<std::string, mechanism*>& mech_instance_by_name)
+{
+    probe_data.clear();
+    probe_resolution_data<Backend> prd{
+        probe_data, state_.get(), cells[cell_idx], cell_idx, D, M, handles, mech_instance_by_name};
+
+    using V = util::any_visitor<
+        cable_probe_membrane_voltage,
+        cable_probe_membrane_voltage_cell,
+        cable_probe_axial_current,
+        cable_probe_total_ion_current_density,
+        cable_probe_total_ion_current_cell,
+        cable_probe_total_current_cell,
+        cable_probe_density_state,
+        cable_probe_density_state_cell,
+        cable_probe_point_state,
+        cable_probe_point_state_cell,
+        cable_probe_ion_current_density,
+        cable_probe_ion_current_cell,
+        cable_probe_ion_int_concentration,
+        cable_probe_ion_int_concentration_cell,
+        cable_probe_ion_ext_concentration,
+        cable_probe_ion_ext_concentration_cell>;
+
+    auto visitor = util::overload(
+        [&prd](auto& probe_addr) { resolve_probe(probe_addr, prd); },
+        [] { throw cable_cell_error("unrecognized probe type"), fvm_probe_data{}; });
+
+    return V::visit(visitor, paddr);
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_membrane_voltage& p, probe_resolution_data<B>& R) {
+    const fvm_value_type* data = R.state->voltage.data();
+
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        fvm_voltage_interpolant in = fvm_interpolate_voltage(R.cell, R.D, R.cell_idx, loc);
+
+        R.result.push_back(fvm_probe_interpolated{
+            {data+in.proximal_cv, data+in.distal_cv},
+            {in.proximal_coef, in.distal_coef},
+            loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_membrane_voltage_cell& p, probe_resolution_data<B>& R) {
+    fvm_probe_multi r;
+    mcable_list cables;
+
+    for (auto cv: R.D.geometry.cell_cvs(R.cell_idx)) {
+        const double* ptr = R.state->voltage.data()+cv;
+        for (auto cable: R.D.geometry.cables(cv)) {
+            r.raw_handles.push_back(ptr);
+            cables.push_back(cable);
+        }
+    }
+    r.metadata = std::move(cables);
+    r.shrink_to_fit();
+
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_axial_current& p, probe_resolution_data<B>& R) {
+    const fvm_value_type* data = R.state->voltage.data();
+
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        fvm_voltage_interpolant in = fvm_axial_current(R.cell, R.D, R.cell_idx, loc);
+
+        R.result.push_back(fvm_probe_interpolated{
+            {data+in.proximal_cv, data+in.distal_cv},
+            {in.proximal_coef, in.distal_coef},
+            loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_total_ion_current_density& p, probe_resolution_data<B>& R) {
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        R.result.push_back(fvm_probe_scalar{
+            {R.state->current_density.data() + R.D.geometry.location_cv(R.cell_idx, loc, cv_prefer::cv_nonempty)},
+            loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_total_ion_current_cell& p, probe_resolution_data<B>& R) {
+    fvm_probe_weighted_multi r;
+
+    for (auto cv: R.D.geometry.cell_cvs(R.cell_idx)) {
+        const double* ptr = R.state->current_density.data()+cv;
+        for (auto cable: R.D.geometry.cables(cv)) {
+            double area = R.cell.embedding().integrate_area(cable); // [µm²]
+            if (area>0) {
+                r.raw_handles.push_back(ptr);
+                r.weight.push_back(0.001*area); // Scale from [µm²·A/m²] to [nA].
+                r.metadata.push_back(cable);
+            }
+        }
+    }
+    r.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_total_current_cell& p, probe_resolution_data<B>& R) {
+    fvm_probe_membrane_currents r;
+
+    auto cell_cv_ival = R.D.geometry.cell_cv_interval(R.cell_idx);
+    auto cv0 = cell_cv_ival.first;
+
+    util::assign(r.cv_parent, util::transform_view(util::subrange_view(R.D.geometry.cv_parent, cell_cv_ival),
+        [cv0](auto cv) { return cv+1==0? cv: cv-cv0; }));
+    util::assign(r.cv_parent_cond, util::subrange_view(R.D.face_conductance, cell_cv_ival));
+
+    r.cv_cables_divs = {0};
+    for (auto cv: R.D.geometry.cell_cvs(R.cell_idx)) {
+        r.raw_handles.push_back(R.state->voltage.data()+cv);
+        double oo_cv_area = R.D.cv_area[cv]>0? 1./R.D.cv_area[cv]: 0;
+
+        for (auto cable: R.D.geometry.cables(cv)) {
+            double area = R.cell.embedding().integrate_area(cable); // [µm²]
+            if (area>0) {
+                r.weight.push_back(area*oo_cv_area);
+                r.metadata.push_back(cable);
+            }
+        }
+        r.cv_cables_divs.push_back(r.metadata.size());
+    }
+    r.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_density_state& p, probe_resolution_data<B>& R) {
+    const fvm_value_type* data = R.mechanism_state(p.mechanism, p.state);
+    if (!data) return;
+
+    auto support = R.mechanism_support(p.mechanism);
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        if (!support.intersects(loc)) continue;
+
+        fvm_index_type cv = R.D.geometry.location_cv(R.cell_idx, loc, cv_prefer::cv_nonempty);
+        auto opt_i = util::binary_search_index(R.M.mechanisms.at(p.mechanism).cv, cv);
+        if (!opt_i) continue;
+
+        R.result.push_back(fvm_probe_scalar{{data+*opt_i}, loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_density_state_cell& p, probe_resolution_data<B>& R) {
+    fvm_probe_multi r;
+
+    const fvm_value_type* data = R.mechanism_state(p.mechanism, p.state);
+    if (!data) return;
+
+    mextent support = R.mechanism_support(p.mechanism);
+    auto& mech_cvs = R.M.mechanisms.at(p.mechanism).cv;
+    mcable_list cables;
+
+    for (auto i: util::count_along(mech_cvs)) {
+        auto cv = mech_cvs[i];
+        auto cv_cables = R.D.geometry.cables(cv);
+        mextent cv_extent = mcable_list(cv_cables.begin(), cv_cables.end());
+        for (auto cable: intersect(cv_extent, support)) {
+            if (cable.prox_pos==cable.dist_pos) continue;
+
+            r.raw_handles.push_back(data+i);
+            cables.push_back(cable);
+        }
+    }
+    r.metadata = std::move(cables);
+    r.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_point_state& p, probe_resolution_data<B>& R) {
+    arb_assert(R.handles.size()==R.M.target_divs.back());
+    arb_assert(R.handles.size()==R.M.n_target);
+
+    const fvm_value_type* data = R.mechanism_state(p.mechanism, p.state);
+    if (!data) return;
+
+    // Convert cell-local target number to cellgroup target number.
+    auto cg_target = p.target + R.M.target_divs[R.cell_idx];
+    if (cg_target>=R.M.target_divs.at(R.cell_idx+1)) return;
+
+    if (R.handles[cg_target].mech_id!=R.mech_instance_by_name.at(p.mechanism)->mechanism_id()) return;
+    auto mech_index = R.handles[cg_target].mech_index;
+
+    auto& multiplicity = R.M.mechanisms.at(p.mechanism).multiplicity;
+    auto& placed_instances = R.cell.synapses().at(p.mechanism);
+
+    auto opt_i = util::binary_search_index(placed_instances, p.target, [](auto& item) { return item.lid; });
+    if (!opt_i) throw arbor_internal_error("inconsistent mechanism state");
+    mlocation loc = placed_instances[*opt_i].loc;
+
+    cable_probe_point_info metadata{p.target, multiplicity.empty()? 1u: multiplicity.at(mech_index), loc};
+
+    R.result.push_back(fvm_probe_scalar{{data+mech_index}, metadata});
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_point_state_cell& p, probe_resolution_data<B>& R) {
+    const fvm_value_type* data = R.mechanism_state(p.mechanism, p.state);
+    if (!data) return;
+
+    unsigned id = R.mech_instance_by_name.at(p.mechanism)->mechanism_id();
+    auto& multiplicity = R.M.mechanisms.at(p.mechanism).multiplicity;
+    auto& placed_instances = R.cell.synapses().at(p.mechanism);
+
+    std::size_t cell_targets_base = R.M.target_divs[R.cell_idx];
+    std::size_t cell_targets_end = R.M.target_divs[R.cell_idx+1];
+
+    fvm_probe_multi r;
+    std::vector<cable_probe_point_info> metadata;
+
+    for (auto target: util::make_span(cell_targets_base, cell_targets_end)) {
+        if (R.handles[target].mech_id!=id) continue;
+
+        auto mech_index = R.handles[target].mech_index;
+        r.raw_handles.push_back(data+mech_index);
+
+        auto cell_target = target-cell_targets_base; // Convert to cell-local target index.
+
+        auto opt_i = util::binary_search_index(placed_instances, cell_target, [](auto& item) { return item.lid; });
+        if (!opt_i) throw arbor_internal_error("inconsistent mechanism state");
+        mlocation loc = placed_instances[*opt_i].loc;
+
+        metadata.push_back(cable_probe_point_info{
+            cell_lid_type(cell_target), multiplicity.empty()? 1u: multiplicity.at(mech_index), loc});
+    }
+
+    r.metadata = std::move(metadata);
+    r.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_current_density& p, probe_resolution_data<B>& R) {
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        auto opt_i = R.ion_location_index(p.ion, loc);
+        if (!opt_i) continue;
+
+        R.result.push_back(fvm_probe_scalar{{R.state->ion_data.at(p.ion).iX_.data()+*opt_i}, loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_current_cell& p, probe_resolution_data<B>& R) {
+    if (!R.state->ion_data.count(p.ion)) return;
+
+    auto& ion_cvs = R.M.ions.at(p.ion).cv;
+    const fvm_value_type* src = R.state->ion_data.at(p.ion).iX_.data();
+
+    fvm_probe_weighted_multi r;
+    for (auto cv: R.D.geometry.cell_cvs(R.cell_idx)) {
+        auto opt_i = util::binary_search_index(ion_cvs, cv);
+        if (!opt_i) continue;
+
+        const double* ptr = src+*opt_i;
+        for (auto cable: R.D.geometry.cables(cv)) {
+            double area = R.cell.embedding().integrate_area(cable); // [µm²]
+            if (area>0) {
+                r.raw_handles.push_back(ptr);
+                r.weight.push_back(0.001*area); // Scale from [µm²·A/m²] to [nA].
+                r.metadata.push_back(cable);
+            }
+        }
+    }
+    r.metadata.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_int_concentration& p, probe_resolution_data<B>& R) {
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        auto opt_i = R.ion_location_index(p.ion, loc);
+        if (!opt_i) continue;
+
+        R.result.push_back(fvm_probe_scalar{{R.state->ion_data.at(p.ion).Xi_.data()+*opt_i}, loc});
+    }
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_ext_concentration& p, probe_resolution_data<B>& R) {
+    for (mlocation loc: thingify(p.locations, R.cell.provider())) {
+        auto opt_i = R.ion_location_index(p.ion, loc);
+        if (!opt_i) continue;
+
+        R.result.push_back(fvm_probe_scalar{{R.state->ion_data.at(p.ion).Xo_.data()+*opt_i}, loc});
+    }
+}
+
+// Common implementation for int and ext concentrations across whole cell:
+template <typename B>
+void resolve_ion_conc_common(const std::vector<fvm_index_type>& ion_cvs, const fvm_value_type* src, probe_resolution_data<B>& R) {
+    fvm_probe_multi r;
+    mcable_list cables;
+
+    for (auto i: util::count_along(ion_cvs)) {
+        for (auto cable: R.D.geometry.cables(ion_cvs[i])) {
+            if (cable.prox_pos!=cable.dist_pos) {
+                r.raw_handles.push_back(src+i);
+                cables.push_back(cable);
+            }
+        }
+    }
+    r.metadata = std::move(cables);
+    r.shrink_to_fit();
+    R.result.push_back(std::move(r));
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_int_concentration_cell& p, probe_resolution_data<B>& R) {
+    if (!R.state->ion_data.count(p.ion)) return;
+    resolve_ion_conc_common<B>(R.M.ions.at(p.ion).cv, R.state->ion_data.at(p.ion).Xi_.data(), R);
+}
+
+template <typename B>
+void resolve_probe(const cable_probe_ion_ext_concentration_cell& p, probe_resolution_data<B>& R) {
+    if (!R.state->ion_data.count(p.ion)) return;
+    resolve_ion_conc_common<B>(R.M.ions.at(p.ion).cv, R.state->ion_data.at(p.ion).Xo_.data(), R);
 }
 
 } // namespace arb

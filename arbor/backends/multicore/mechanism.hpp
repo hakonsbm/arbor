@@ -65,6 +65,9 @@ public:
 
     void set_parameter(const std::string& key, const std::vector<fvm_value_type>& values) override;
 
+    // Peek into mechanism state variable; implements arb::multicore::backend::mechanism_field_data.
+    fvm_value_type* field_data(const std::string& state_var);
+
 protected:
     size_type width_ = 0;        // Instance width (number of CVs/sites)
     size_type width_padded_ = 0; // Width rounded up to multiple of pad/alignment.
@@ -133,6 +136,10 @@ protected:
     virtual mechanism_state_table state_table() { return {}; }
     virtual mechanism_ion_state_table ion_state_table() { return {}; }
     virtual mechanism_ion_index_table ion_index_table() { return {}; }
+
+    // Simd width used in mechanism.
+
+    virtual unsigned simd_width() const { return 1; }
 
     // Report raw size in bytes of mechanism object.
 

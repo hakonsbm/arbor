@@ -35,15 +35,6 @@ bool Parser::expect(tok tok, std::string const& str) {
     return false;
 }
 
-void Parser::parse_unit() {
-    if(token_.type == tok::lparen) {
-        while (token_.type != tok::rparen) {
-            get_token();
-        }
-        get_token(); // consume ')'
-    }
-}
-
 void Parser::error(std::string msg) {
     std::string location_info = pprintf(
             "%:% ", module_ ? module_->source_name() : "", token_.location);
@@ -137,12 +128,6 @@ bool Parser::parse() {
                 if(!f) break;
                 module_->add_callable(std::move(f));
                 }
-                break;
-            case tok::unitson :
-                get_token();
-                break;
-            case tok::unitsoff :
-                get_token();
                 break;
             default :
                 error(pprintf("expected block type, found '%'", token_.spelling));
@@ -414,8 +399,15 @@ void Parser::parse_state_block() {
         }
 
         parm.token = token_;
-        //state_block.state_variables.push_back(token_.spelling);
         get_token();
+
+        if(token_.type == tok::from) {
+            // silently skips from/to
+            from_to_description();
+            if (status_ == lexerStatus::error) {
+                return;
+            }
+        }
 
         // get unit parameters
         if (line == location_.line && token_.type == tok::lparen) {
@@ -778,16 +770,26 @@ std::pair<Token, Token> Parser::range_description() {
     }
 
     get_token();
+    if(token_.type != tok::integer) {
+        error(pprintf("range description must be <int, int>, found '%'", token_));
+        return {};
+    }
     lb = token_;
 
+    get_token();
     if(token_.type != tok::comma) {
         error(pprintf("range description must separate lower and upper bound with a comma '%'", token_));
         return {};
     }
 
     get_token();
+    if(token_.type != tok::integer) {
+        error(pprintf("range description must be <int, int>, found '%'", token_));
+        return {};
+    }
     ub = token_;
 
+    get_token();
     if(token_.type != tok::gt) {
         error(pprintf("range description must end with a right angle bracket '%'", token_));
         return {};
@@ -796,6 +798,39 @@ std::pair<Token, Token> Parser::range_description() {
     get_token();
     return {lb, ub};
 }
+
+std::pair<Token, Token> Parser::from_to_description() {
+    Token lb, ub;
+
+    if(token_.type != tok::from) {
+        error(pprintf("range description must be of form FROM <int> TO <int>, found '%'", token_));
+        return {};
+    }
+
+    get_token();
+    if(token_.type != tok::integer) {
+        error(pprintf("range description must be of form FROM <int> TO <int>, found '%'", token_));
+        return {};
+    }
+    lb = token_;
+
+    get_token();
+    if(token_.type != tok::to) {
+        error(pprintf("range description must be of form FROM <int> TO <int>, found '%'", token_));
+        return {};
+    }
+
+    get_token();
+    if(token_.type != tok::integer) {
+        error(pprintf("range description must be of form FROM <int> TO <int>, found '%'", token_));
+        return {};
+    }
+    ub = token_;
+
+    get_token();
+    return {lb, ub};
+}
+
 
 // Returns a prototype expression for a function or procedure call
 // Takes an optional argument that allows the user to specify the
@@ -817,7 +852,6 @@ expression_ptr Parser::parse_prototype(std::string name=std::string()) {
     // check for an argument list enclosed in parenthesis (...)
     // return a prototype with an empty argument list if not found
     if( token_.type != tok::lparen ) {
-        //return make_expression<PrototypeExpression>(identifier.location, identifier.spelling, {});
         return expression_ptr{new PrototypeExpression(identifier.location, identifier.spelling, {})};
     }
 
@@ -835,7 +869,13 @@ expression_ptr Parser::parse_prototype(std::string name=std::string()) {
 
         get_token(); // consume the identifier
 
-        parse_unit(); // consume the unit if provided
+        // args may have a unit attached
+        if(token_.type == tok::lparen) {
+            unit_description();
+            if(status_ == lexerStatus::error) {
+                return {};
+            }
+        }
 
         // look for a comma
         if(!(token_.type == tok::comma || token_.type==tok::rparen)) {
@@ -966,8 +1006,6 @@ symbol_ptr Parser::parse_function() {
     // parse the prototype
     auto p = parse_prototype();
     if(p==nullptr) return nullptr;
-
-    parse_unit();
 
     // check for opening left brace {
     if(!expect(tok::lbrace)) return nullptr;
@@ -1365,6 +1403,7 @@ expression_ptr Parser::parse_unaryop() {
         case tok::cos    :
         case tok::log    :
         case tok::abs    :
+        case tok::safeinv:
         case tok::exprelr:
             get_token();        // consume operator (exp, sin, cos or log)
             if(token_.type!=tok::lparen) {
@@ -1661,7 +1700,10 @@ expression_ptr Parser::parse_if() {
 
         // handle 'else if {}' case recursively
         if(token_.type == tok::if_stmt) {
-            false_branch = parse_if();
+            expr_list_type if_block;
+            auto exp = parse_if();
+            if_block.push_back(std::move(exp));
+            false_branch = make_expression<BlockExpression>(Location(), std::move(if_block), true);
         }
         // we have a closing 'else {}'
         else if(token_.type == tok::lbrace) {

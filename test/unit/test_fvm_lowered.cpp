@@ -9,11 +9,12 @@
 #include <arbor/load_balance.hpp>
 #include <arbor/math.hpp>
 #include <arbor/cable_cell.hpp>
-#include <arbor/segment.hpp>
 #include <arbor/recipe.hpp>
 #include <arbor/sampling.hpp>
 #include <arbor/simulation.hpp>
 #include <arbor/schedule.hpp>
+
+#include <arborenv/concurrency.hpp>
 
 #include "algorithms.hpp"
 #include "backends/multicore/fvm.hpp"
@@ -21,10 +22,12 @@
 #include "execution_context.hpp"
 #include "fvm_lowered_cell.hpp"
 #include "fvm_lowered_cell_impl.hpp"
+#include "mech_private_field_access.hpp"
 #include "sampler_map.hpp"
 #include "util/meta.hpp"
 #include "util/maputil.hpp"
 #include "util/rangeutil.hpp"
+#include "util/transform.hpp"
 
 #include "common.hpp"
 #include "unit_test_catalogue.hpp"
@@ -203,7 +206,14 @@ private:
 
 TEST(fvm_lowered, matrix_init)
 {
-    execution_context context;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
 
     auto isnan = [](auto v) { return std::isnan(v); };
     auto ispos = [](auto v) { return v>0; };
@@ -215,12 +225,13 @@ TEST(fvm_lowered, matrix_init)
 
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     fvm_cell fvcell(context);
     fvcell.initialize({0}, cable1d_recipe(cell), cell_to_intdom, targets, probe_map);
 
     auto& J = fvcell.*private_matrix_ptr;
+    auto& S = fvcell.*private_state_ptr;
     EXPECT_EQ(J.size(), 12u);
 
     // Test that the matrix is initialized with sensible values
@@ -232,7 +243,7 @@ TEST(fvm_lowered, matrix_init)
 
     EXPECT_FALSE(util::any_of(util::subrange_view(mat.u, 1, n), isnan));
     EXPECT_FALSE(util::any_of(mat.d, isnan));
-    EXPECT_FALSE(util::any_of(J.solution(), isnan));
+    EXPECT_FALSE(util::any_of(S->voltage, isnan));
 
     EXPECT_FALSE(util::any_of(util::subrange_view(mat.u, 1, n), ispos));
     EXPECT_FALSE(util::any_of(mat.d, isneg));
@@ -241,19 +252,26 @@ TEST(fvm_lowered, matrix_init)
 TEST(fvm_lowered, target_handles) {
     using namespace arb;
 
-    execution_context context;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
 
     cable_cell cells[] = {
         make_cell_ball_and_stick(),
         make_cell_ball_and_3stick()
     };
 
-    EXPECT_EQ(cells[0].num_branches(), 2u);
-    EXPECT_EQ(cells[1].num_branches(), 4u);
+    EXPECT_EQ(cells[0].morphology().num_branches(), 1u);
+    EXPECT_EQ(cells[1].morphology().num_branches(), 3u);
 
     // (in increasing target order)
-    cells[0].place(mlocation{1, 0.4}, "expsyn");
-    cells[0].place(mlocation{0, 0.5}, "expsyn");
+    cells[0].place(mlocation{0, 0.7}, "expsyn");
+    cells[0].place(mlocation{0, 0.3}, "expsyn");
     cells[1].place(mlocation{2, 0.2}, "exp2syn");
     cells[1].place(mlocation{2, 0.8}, "expsyn");
 
@@ -261,12 +279,12 @@ TEST(fvm_lowered, target_handles) {
 
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     auto test_target_handles = [&](fvm_cell& cell) {
-        mechanism *expsyn = find_mechanism(cell, "expsyn");
+        mechanism* expsyn = find_mechanism(cell, "expsyn");
         ASSERT_TRUE(expsyn);
-        mechanism *exp2syn = find_mechanism(cell, "exp2syn");
+        mechanism* exp2syn = find_mechanism(cell, "exp2syn");
         ASSERT_TRUE(exp2syn);
 
         unsigned expsyn_id = expsyn->mechanism_id();
@@ -311,13 +329,22 @@ TEST(fvm_lowered, stimulus) {
     // amplitude | 0.3  |  0.1
     // CV        |   5  |    0
 
-    execution_context context;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
 
     std::vector<cable_cell> cells;
     cells.push_back(make_cell_ball_and_stick(false));
 
-    cells[0].place(mlocation{1,1},   i_clamp{5., 80., 0.3});
-    cells[0].place(mlocation{0,0.5}, i_clamp{1., 2.,  0.1});
+    // At end of stick
+    cells[0].place(mlocation{0,1},   i_clamp{5., 80., 0.3});
+    // On the soma CV, which is over the approximate interval: (cable 0 0 0.1)
+    cells[0].place(mlocation{0,0.05}, i_clamp{1., 2.,  0.1});
 
     const fvm_size_type soma_cv = 0u;
     const fvm_size_type tip_cv = 5u;
@@ -333,11 +360,11 @@ TEST(fvm_lowered, stimulus) {
     cable_cell_global_properties gprop;
     gprop.default_parameters = neuron_parameter_defaults;
 
-    fvm_discretization D = fvm_discretize(cells, gprop.default_parameters);
+    fvm_cv_discretization D = fvm_cv_discretize(cells, gprop.default_parameters, context);
     const auto& A = D.cv_area;
 
     std::vector<target_handle> targets;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     fvm_cell fvcell(context);
     fvcell.initialize({0}, cable1d_recipe(cells), cell_to_intdom, targets, probe_map);
@@ -392,11 +419,19 @@ TEST(fvm_lowered, derived_mechs) {
     //
     // 3. Cell with both test_kin1 and custom_kin1.
 
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+
     std::vector<cable_cell> cells;
     cells.reserve(3);
+    soma_cell_builder builder(6);
+    builder.add_branch(0, 100, 0.5, 0.5, 4, "dend");
     for (int i = 0; i<3; ++i) {
-        soma_cell_builder builder(6);
-        builder.add_branch(0, 100, 0.5, 0.5, 4, "dend");
         auto cell = builder.make_cell();
 
         switch (i) {
@@ -415,9 +450,10 @@ TEST(fvm_lowered, derived_mechs) {
     }
 
     cable1d_recipe rec(cells);
+    rec.catalogue() = make_unit_test_catalogue();
     rec.catalogue().derive("custom_kin1", "test_kin1", {{"tau", 20.0}});
 
-    cell_probe_address where{{1, 0.3}, cell_probe_address::membrane_current};
+    cable_probe_total_ion_current_density where{builder.location({1, 0.3})};
     rec.add_probe(0, 0, where);
     rec.add_probe(1, 0, where);
     rec.add_probe(2, 0, where);
@@ -427,9 +463,9 @@ TEST(fvm_lowered, derived_mechs) {
 
         std::vector<target_handle> targets;
         std::vector<fvm_index_type> cell_to_intdom;
-        probe_association_map<probe_handle> probe_map;
+        probe_association_map probe_map;
 
-        execution_context context;
+        arb::execution_context context(resources);
         fvm_cell fvcell(context);
         fvcell.initialize({0, 1, 2}, rec, cell_to_intdom, targets, probe_map);
 
@@ -458,16 +494,17 @@ TEST(fvm_lowered, derived_mechs) {
 
         std::vector<double> samples[3];
 
-        sampler_function sampler = [&](cell_member_type pid, probe_tag, std::size_t n, const sample_record* records) {
-            for (std::size_t i = 0; i<n; ++i) {
-                double v = *util::any_cast<const double*>(records[i].data);
-                samples[pid.gid].push_back(v);
-            }
-        };
+        sampler_function sampler =
+            [&](probe_metadata pm, std::size_t n, const sample_record* records) {
+                for (std::size_t i = 0; i<n; ++i) {
+                    double v = *util::any_cast<const double*>(records[i].data);
+                    samples[pm.id.gid].push_back(v);
+                }
+            };
 
         float times[] = {10.f, 20.f};
 
-        auto ctx = make_context();
+        auto ctx = make_context(resources);
         auto decomp = partition_load_balance(rec, ctx);
         simulation sim(rec, decomp, ctx);
         sim.add_sampler(all_probes, explicit_schedule(times), sampler);
@@ -488,11 +525,17 @@ TEST(fvm_lowered, derived_mechs) {
 // Test that ion charge is propagated into mechanism variable.
 
 TEST(fvm_lowered, read_valence) {
-    execution_context context;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
 
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     {
         std::vector<cable_cell> cells(1);
@@ -503,6 +546,7 @@ TEST(fvm_lowered, read_valence) {
         cable1d_recipe rec({std::move(cell)});
         rec.catalogue() = make_unit_test_catalogue();
 
+        arb::execution_context context(resources);
         fvm_cell fvcell(context);
         fvcell.initialize({0}, rec, cell_to_intdom, targets, probe_map);
 
@@ -530,6 +574,7 @@ TEST(fvm_lowered, read_valence) {
         rec.catalogue().derive("cr_read_valence", "na_read_valence", {}, {{"na", "mn"}});
         rec.add_ion("mn", 7, 0, 0, 0);
 
+        arb::execution_context context(resources);
         fvm_cell fvcell(context);
         fvcell.initialize({0}, rec, cell_to_intdom, targets, probe_map);
 
@@ -543,15 +588,86 @@ TEST(fvm_lowered, read_valence) {
 }
 
 // Test correct scaling of ionic currents in reading and writing
+TEST(fvm_lowered, ionic_concentrations) {
+    auto cat = make_unit_test_catalogue();
+
+    // one cell, one CV:
+    fvm_size_type ncell = 1;
+    fvm_size_type ncv = 1;
+    std::vector<fvm_index_type> cv_to_intdom(ncv, 0);
+    std::vector<fvm_value_type> temp(ncv, 23);
+    std::vector<fvm_value_type> diam(ncv, 1.);
+    std::vector<fvm_value_type> vinit(ncv, -65);
+    std::vector<fvm_gap_junction> gj = {};
+
+    fvm_ion_config ion_config;
+    mechanism_layout layout;
+    mechanism_overrides overrides;
+
+    layout.weight.assign(ncv, 1.);
+    for (fvm_size_type i = 0; i<ncv; ++i) {
+        layout.cv.push_back(i);
+        ion_config.cv.push_back(i);
+    }
+    ion_config.init_revpot.assign(ncv, 0.);
+    ion_config.init_econc.assign(ncv, 0.);
+    ion_config.init_iconc.assign(ncv, 0.);
+    ion_config.reset_econc.assign(ncv, 0.);
+    ion_config.reset_iconc.assign(ncv, 2.3e-4);
+
+    auto read_cai  = cat.instance<backend>("read_cai_init");
+    auto write_cai = cat.instance<backend>("write_cai_breakpoint");
+
+    auto& read_cai_mech  = read_cai.mech;
+    auto& write_cai_mech = write_cai.mech;
+
+    auto shared_state = std::make_unique<typename backend::shared_state>(
+            ncell, cv_to_intdom, gj, vinit, temp, diam, read_cai_mech->data_alignment());
+    shared_state->add_ion("ca", 2, ion_config);
+
+    read_cai_mech->instantiate(0, *shared_state, overrides, layout);
+    write_cai_mech->instantiate(1, *shared_state, overrides, layout);
+
+    shared_state->reset();
+
+    // expect 2.3 value in state 's' in read_cai_init after init:
+    read_cai_mech->initialize();
+    write_cai_mech->initialize();
+
+    std::vector<fvm_value_type> expected_s_values(ncv, 2.3e-4);
+
+    EXPECT_EQ(expected_s_values, mechanism_field(read_cai_mech.get(), "s"));
+
+    // expect 5.2 + 2.3 value in state 's' in read_cai_init after state update:
+    read_cai_mech->nrn_state();
+    write_cai_mech->nrn_state();
+
+    read_cai_mech->write_ions();
+    write_cai_mech->write_ions();
+
+    read_cai_mech->nrn_state();
+
+    expected_s_values.assign(ncv, 7.5e-4);
+    EXPECT_EQ(expected_s_values, mechanism_field(read_cai_mech.get(), "s"));
+}
 
 TEST(fvm_lowered, ionic_currents) {
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
+
     soma_cell_builder b(6);
 
     // Mechanism parameter is in NMODL units, i.e. mA/cm².
 
     const double jca = 1.5;
     mechanism_desc m1("fixed_ica_current");
-    m1["ica_density"] = jca;
+    m1["current_density"] = jca;
 
     // Mechanism models a well-mixed fixed-depth volume without replenishment,
     // giving a linear response to ica over time.
@@ -571,11 +687,9 @@ TEST(fvm_lowered, ionic_currents) {
     cable1d_recipe rec(std::move(c));
     rec.catalogue() = make_unit_test_catalogue();
 
-    execution_context context;
-
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     fvm_cell fvcell(context);
     fvcell.initialize({0}, rec, cell_to_intdom, targets, probe_map);
@@ -597,6 +711,15 @@ TEST(fvm_lowered, ionic_currents) {
 // Test correct scaling of an ionic current updated via a point mechanism
 
 TEST(fvm_lowered, point_ionic_current) {
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
+
     double r = 6.0; // [µm]
     soma_cell_builder b(r);
     cable_cell c = b.make_cell();
@@ -609,11 +732,9 @@ TEST(fvm_lowered, point_ionic_current) {
     cable1d_recipe rec(c);
     rec.catalogue() = make_unit_test_catalogue();
 
-    execution_context context;
-
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     fvm_cell fvcell(context);
     fvcell.initialize({0}, rec, cell_to_intdom, targets, probe_map);
@@ -639,8 +760,8 @@ TEST(fvm_lowered, point_ionic_current) {
 // Test area-weighted linear combination of ion species concentrations
 
 TEST(fvm_lowered, weighted_write_ion) {
-    // Create a cell with 4 segments (same morphopology as in fvm_layout.ion_weights test):
-    //   - Soma (segment 0) plus three dendrites (1, 2, 3) meeting at a branch point.
+    // Create a cell with 3 branches (same morphopology as in fvm_layout.ion_weights test):
+    //   - Soma (part of branch 0) plus three dendrites (d1, d2, d3) meeting at a branch point.
     //   - Dendritic segments are given 1 compartments each.
     //
     //          /
@@ -651,19 +772,26 @@ TEST(fvm_lowered, weighted_write_ion) {
     //         d3
     //
     // The CV corresponding to the branch point should comprise the terminal
-    // 1/2 of segment 1 and the initial 1/2 of segments 2 and 3.
+    // 1/2 of branch 1 and the initial 1/2 of branches 2 and 3.
     //
     // Geometry:
-    //   soma 0: radius 5 µm
-    //   dend 1: 100 µm long, 1 µm diameter cylinder
-    //   dend 2: 200 µm long, 1 µm diameter cylinder
-    //   dend 3: 100 µm long, 1 µm diameter cylinder
+    //   soma 0:  10 µm long, 10 µm diameter cylinder: area = 100π μm²
+    //   dend 1: 100 µm long,  1 µm diameter cylinder: area = 100π μm²
+    //   dend 2: 200 µm long,  1 µm diameter cylinder: area = 200π μm²
+    //   dend 3: 100 µm long,  1 µm diameter cylinder: area = 100π μm²
     //
     // The radius of the soma is chosen such that the surface area of soma is
     // the same as a 100 µm dendrite, which makes it easier to describe the
     // expected weights.
 
-    execution_context context;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
 
     soma_cell_builder b(5);
     b.add_branch(0, 100, 0.5, 0.5, 1, "dend");
@@ -675,18 +803,19 @@ TEST(fvm_lowered, weighted_write_ion) {
     const double con_int = 80;
     const double con_ext = 120;
 
-    // Ca ion reader test_kinlva on CV 2 and 3 via segment 2:
-    c.segments()[2] ->add_mechanism("test_kinlva");
+    // Ca ion reader test_kinlva on CV 2 and 3 via branch 2:
+    c.paint(reg::branch(1), "test_kinlva");
 
-    // Ca ion writer test_ca on CV 2 and 4 via segment 3:
-    c.segments()[3] ->add_mechanism("test_ca");
+    // Ca ion writer test_ca on CV 2 and 4 via branch 3:
+    c.paint(reg::branch(2), "test_ca");
 
     cable1d_recipe rec(c);
+    rec.catalogue() = make_unit_test_catalogue();
     rec.add_ion("ca", 2, con_int, con_ext, 0.0);
 
     std::vector<target_handle> targets;
     std::vector<fvm_index_type> cell_to_intdom;
-    probe_association_map<probe_handle> probe_map;
+    probe_association_map probe_map;
 
     fvm_cell fvcell(context);
     fvcell.initialize({0}, rec, cell_to_intdom, targets, probe_map);
@@ -701,7 +830,7 @@ TEST(fvm_lowered, weighted_write_ion) {
 
     std::vector<double> ion_init_iconc = util::assign_from(ion.init_Xi_);
     std::vector<double> expected_init_iconc = {0.75*con_int, 1.*con_int, 0};
-    EXPECT_EQ(expected_init_iconc, ion_init_iconc);
+    EXPECT_TRUE(testing::seq_almost_eq<double>(expected_init_iconc, ion_init_iconc));
 
     auto test_ca = dynamic_cast<multicore::mechanism*>(find_mechanism(fvcell, "test_ca"));
 
@@ -728,10 +857,19 @@ TEST(fvm_lowered, weighted_write_ion) {
     ion.init_concentration();
     test_ca->write_ions();
     std::vector<double> ion_iconc = util::assign_from(ion.Xi_);
-    EXPECT_EQ(expected_iconc, ion_iconc);
+    EXPECT_TRUE(testing::seq_almost_eq<double>(expected_iconc, ion_iconc));
 }
 
 TEST(fvm_lowered, gj_coords_simple) {
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
+
     using pair = std::pair<int, int>;
 
     class gap_recipe: public recipe {
@@ -753,7 +891,6 @@ TEST(fvm_lowered, gj_coords_simple) {
         cell_size_type n_ = 2;
     };
 
-    execution_context context;
     fvm_cell fvcell(context);
 
     gap_recipe rec;
@@ -762,7 +899,7 @@ TEST(fvm_lowered, gj_coords_simple) {
         soma_cell_builder b(2.1);
         b.add_branch(0, 10, 0.3, 0.2, 5, "dend");
         auto c = b.make_cell();
-        c.place(mlocation{1, 0.8}, gap_junction_site{});
+        c.place(b.location({1, 0.8}), gap_junction_site{});
         cells.push_back(std::move(c));
     }
 
@@ -770,11 +907,11 @@ TEST(fvm_lowered, gj_coords_simple) {
         soma_cell_builder b(2.4);
         b.add_branch(0, 10, 0.3, 0.2, 2, "dend");
         auto c = b.make_cell();
-        c.place(mlocation{1, 1}, gap_junction_site{});
+        c.place(b.location({1, 1}), gap_junction_site{});
         cells.push_back(std::move(c));
     }
 
-    fvm_discretization D = fvm_discretize(cells, neuron_parameter_defaults);
+    fvm_cv_discretization D = fvm_cv_discretize(cells, neuron_parameter_defaults, context);
 
     std::vector<cell_gid_type> gids = {0, 1};
     auto GJ = fvcell.fvm_gap_junctions(cells, gids, rec, D);
@@ -791,7 +928,14 @@ TEST(fvm_lowered, gj_coords_simple) {
 }
 
 TEST(fvm_lowered, gj_coords_complex) {
-    using pair = std::pair<int, int>;
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
 
     class gap_recipe: public recipe {
     public:
@@ -805,23 +949,26 @@ TEST(fvm_lowered, gj_coords_complex) {
         std::vector<arb::gap_junction_connection> gap_junctions_on(cell_gid_type gid) const override{
             std::vector<gap_junction_connection> conns;
             switch (gid) {
-                case 0 :  return {
-                            gap_junction_connection({2, 0}, {0, 1}, 0.01),
-                            gap_junction_connection({1, 0}, {0, 0}, 0.03),
-                            gap_junction_connection({1, 1}, {0, 0}, 0.04)
-                    };
-                case 1 :  return {
-                            gap_junction_connection({0, 0}, {1, 0}, 0.03),
-                            gap_junction_connection({0, 0}, {1, 1}, 0.04),
-                            gap_junction_connection({2, 1}, {1, 2}, 0.02),
-                            gap_junction_connection({2, 2}, {1, 3}, 0.01)
-                    };
-                case 2 :  return {
-                            gap_junction_connection({0, 1}, {2, 0}, 0.01),
-                            gap_junction_connection({1, 2}, {2, 1}, 0.02),
-                            gap_junction_connection({1, 3}, {2, 2}, 0.01)
-                    };
-                default : return {};
+            case 0:
+                return {
+                    gap_junction_connection({2, 0}, {0, 1}, 0.01),
+                    gap_junction_connection({1, 0}, {0, 0}, 0.03),
+                    gap_junction_connection({1, 1}, {0, 0}, 0.04)
+                };
+            case 1:
+                return {
+                    gap_junction_connection({0, 0}, {1, 0}, 0.03),
+                    gap_junction_connection({0, 0}, {1, 1}, 0.04),
+                    gap_junction_connection({2, 1}, {1, 2}, 0.02),
+                    gap_junction_connection({2, 2}, {1, 3}, 0.01)
+                };
+            case 2:
+                return {
+                    gap_junction_connection({0, 1}, {2, 0}, 0.01),
+                    gap_junction_connection({1, 2}, {2, 1}, 0.02),
+                    gap_junction_connection({1, 3}, {2, 2}, 0.01)
+                };
+            default : return {};
             }
             return conns;
         }
@@ -830,16 +977,15 @@ TEST(fvm_lowered, gj_coords_complex) {
         cell_size_type n_ = 3;
     };
 
-    execution_context context;
-    fvm_cell fvcell(context);
-
     // Add 5 gap junctions
     soma_cell_builder b0(2.1);
     b0.add_branch(0, 8, 0.3, 0.2, 4, "dend");
 
     auto c0 = b0.make_cell();
-    c0.place(mlocation{1, 1}, gap_junction_site{});
-    c0.place(mlocation{1, 0.5}, gap_junction_site{});
+    mlocation c0_gj[2] = {b0.location({1, 1}), b0.location({1, 0.5})};
+
+    c0.place(c0_gj[0], gap_junction_site{});
+    c0.place(c0_gj[1], gap_junction_site{});
 
     soma_cell_builder b1(1.4);
     b1.add_branch(0, 12, 0.3, 0.5, 6, "dend");
@@ -847,10 +993,13 @@ TEST(fvm_lowered, gj_coords_complex) {
     b1.add_branch(1,  5, 0.2, 0.2, 5, "dend");
 
     auto c1 = b1.make_cell();
-    c1.place(mlocation{2, 1}, gap_junction_site{});
-    c1.place(mlocation{1, 1}, gap_junction_site{});
-    c1.place(mlocation{1, 0.45}, gap_junction_site{});
-    c1.place(mlocation{1, 0.1}, gap_junction_site{});
+    mlocation c1_gj[4] = {b1.location({2, 1}), b1.location({1, 1}), b1.location({1, 0.45}), b1.location({1, 0.1})};
+
+    c1.place(c1_gj[0], gap_junction_site{});
+    c1.place(c1_gj[1], gap_junction_site{});
+    c1.place(c1_gj[2], gap_junction_site{});
+    c1.place(c1_gj[3], gap_junction_site{});
+
 
     soma_cell_builder b2(2.9);
     b2.add_branch(0, 4, 0.3, 0.5, 2, "dend");
@@ -860,9 +1009,11 @@ TEST(fvm_lowered, gj_coords_complex) {
     b2.add_branch(2, 4, 0.2, 0.2, 2, "dend");
 
     auto c2 = b2.make_cell();
-    c2.place(mlocation{1, 0.5}, gap_junction_site{});
-    c2.place(mlocation{4, 1}, gap_junction_site{});
-    c2.place(mlocation{2, 1}, gap_junction_site{});
+    mlocation c2_gj[3] = {b2.location({1, 0.5}), b2.location({4, 1}), b2.location({2, 1})};
+
+    c2.place(c2_gj[0], gap_junction_site{});
+    c2.place(c2_gj[1], gap_junction_site{});
+    c2.place(c2_gj[2], gap_junction_site{});
 
     std::vector<cable_cell> cells{std::move(c0), std::move(c1), std::move(c2)};
 
@@ -871,36 +1022,63 @@ TEST(fvm_lowered, gj_coords_complex) {
     std::vector<cell_gid_type> gids = {0, 1, 2};
 
     gap_recipe rec;
+    fvm_cell fvcell(context);
     fvcell.fvm_intdom(rec, gids, cell_to_intdom);
-    fvm_discretization D = fvm_discretize(cells, neuron_parameter_defaults);
+    fvm_cv_discretization D = fvm_cv_discretize(cells, neuron_parameter_defaults, context);
 
-    auto GJ = fvcell.fvm_gap_junctions(cells, gids, rec, D);
+    using namespace cv_prefer;
+    int c0_gj_cv[2];
+    for (int i = 0; i<2; ++i) c0_gj_cv[i] = D.geometry.location_cv(0, c0_gj[i], cv_nonempty);
+
+    int c1_gj_cv[4];
+    for (int i = 0; i<4; ++i) c1_gj_cv[i] = D.geometry.location_cv(1, c1_gj[i], cv_nonempty);
+
+    int c2_gj_cv[3];
+    for (int i = 0; i<3; ++i) c2_gj_cv[i] = D.geometry.location_cv(2, c2_gj[i], cv_nonempty);
+
+    std::vector<fvm_gap_junction> GJ = fvcell.fvm_gap_junctions(cells, gids, rec, D);
     EXPECT_EQ(10u, GJ.size());
 
     auto weight = [&](fvm_value_type g, fvm_index_type i){
         return g * 1e3 / D.cv_area[i];
     };
 
-    std::vector<pair> expected_loc = {{5, 16}, {5,13}, {3,24}, {16, 5}, {13,5} ,{10,31}, {8, 27}, {24,3}, {31,10}, {27, 8}};
-    std::vector<double> expected_weight = {
-            weight(0.03, 5), weight(0.04, 5), weight(0.01, 3), weight(0.03, 16), weight(0.04, 13),
-            weight(0.02, 10), weight(0.01, 8), weight(0.01, 24), weight(0.02, 31), weight(0.01, 27)
+    std::vector<fvm_gap_junction> expected = {
+        {{c0_gj_cv[0], c1_gj_cv[0]}, weight(0.03, c0_gj_cv[0])},
+        {{c0_gj_cv[0], c1_gj_cv[1]}, weight(0.04, c0_gj_cv[0])},
+        {{c0_gj_cv[1], c2_gj_cv[0]}, weight(0.01, c0_gj_cv[1])},
+        {{c1_gj_cv[0], c0_gj_cv[0]}, weight(0.03, c1_gj_cv[0])},
+        {{c1_gj_cv[1], c0_gj_cv[0]}, weight(0.04, c1_gj_cv[1])},
+        {{c1_gj_cv[2], c2_gj_cv[1]}, weight(0.02, c1_gj_cv[2])},
+        {{c1_gj_cv[3], c2_gj_cv[2]}, weight(0.01, c1_gj_cv[3])},
+        {{c2_gj_cv[0], c0_gj_cv[1]}, weight(0.01, c2_gj_cv[0])},
+        {{c2_gj_cv[1], c1_gj_cv[2]}, weight(0.02, c2_gj_cv[1])},
+        {{c2_gj_cv[2], c1_gj_cv[3]}, weight(0.01, c2_gj_cv[2])}
     };
 
-    for (unsigned i = 0; i < GJ.size(); i++) {
-        bool found = false;
-        for (unsigned j = 0; j < expected_loc.size(); j++) {
-            if (expected_loc[j].first ==  GJ[i].loc.first && expected_loc[j].second ==  GJ[i].loc.second) {
-                found = true;
-                EXPECT_EQ(expected_weight[j], GJ[i].weight);
-                break;
-            }
-        }
-        EXPECT_TRUE(found);
-    }
+    using util::sort_by;
+    using util::transform_view;
+
+    auto gj_loc = [](const fvm_gap_junction gj) { return gj.loc; };
+    auto gj_weight = [](const fvm_gap_junction gj) { return gj.weight; };
+
+    sort_by(GJ, [](fvm_gap_junction gj) { return gj.loc; });
+    sort_by(expected, [](fvm_gap_junction gj) { return gj.loc; });
+
+    EXPECT_TRUE(testing::seq_eq(transform_view(expected, gj_loc), transform_view(GJ, gj_loc)));
+    EXPECT_TRUE(testing::seq_almost_eq<double>(transform_view(expected, gj_weight), transform_view(GJ, gj_weight)));
 }
 
 TEST(fvm_lowered, cell_group_gj) {
+    arb::proc_allocation resources;
+    if (auto nt = arbenv::get_env_num_threads()) {
+        resources.num_threads = nt;
+    }
+    else {
+        resources.num_threads = arbenv::thread_concurrency();
+    }
+    arb::execution_context context(resources);
+
     using pair = std::pair<int, int>;
 
     class gap_recipe: public recipe {
@@ -927,8 +1105,6 @@ TEST(fvm_lowered, cell_group_gj) {
     protected:
         cell_size_type n_ = 20;
     };
-    execution_context context;
-    fvm_cell fvcell(context);
 
     gap_recipe rec;
     std::vector<cable_cell> cell_group0;
@@ -953,11 +1129,13 @@ TEST(fvm_lowered, cell_group_gj) {
 
     std::vector<fvm_index_type> cell_to_intdom0, cell_to_intdom1;
 
+    fvm_cell fvcell(context);
+
     auto num_dom0 = fvcell.fvm_intdom(rec, gids_cg0, cell_to_intdom0);
     auto num_dom1 = fvcell.fvm_intdom(rec, gids_cg1, cell_to_intdom1);
 
-    fvm_discretization D0 = fvm_discretize(cell_group0, neuron_parameter_defaults);
-    fvm_discretization D1 = fvm_discretize(cell_group1, neuron_parameter_defaults);
+    fvm_cv_discretization D0 = fvm_cv_discretize(cell_group0, neuron_parameter_defaults, context);
+    fvm_cv_discretization D1 = fvm_cv_discretize(cell_group1, neuron_parameter_defaults, context);
 
     auto GJ0 = fvcell.fvm_gap_junctions(cell_group0, gids_cg0, rec, D0);
     auto GJ1 = fvcell.fvm_gap_junctions(cell_group1, gids_cg1, rec, D1);

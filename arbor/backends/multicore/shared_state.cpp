@@ -26,9 +26,10 @@
 namespace arb {
 namespace multicore {
 
-constexpr unsigned simd_width = simd::simd_abi::native_width<fvm_value_type>::value;
-using simd_value_type = simd::simd<fvm_value_type, simd_width>;
-using simd_index_type = simd::simd<fvm_index_type, simd_width>;
+constexpr unsigned vector_length = (unsigned) simd::simd_abi::native_width<fvm_value_type>::value;
+using simd_value_type = simd::simd<fvm_value_type, vector_length, simd::simd_abi::default_abi>;
+using simd_index_type = simd::simd<fvm_index_type, vector_length, simd::simd_abi::default_abi>;
+const int simd_width  = simd::width<simd_value_type>();
 
 // Pick alignment compatible with native SIMD width for explicitly
 // vectorized operations below.
@@ -48,21 +49,20 @@ using pad = util::padded_allocator<>;
 
 ion_state::ion_state(
     int charge,
-    const std::vector<fvm_index_type>& cv,
-    const std::vector<fvm_value_type>& init_Xi,
-    const std::vector<fvm_value_type>& init_Xo,
-    const std::vector<fvm_value_type>& init_eX,
+    const fvm_ion_config& ion_data,
     unsigned align
 ):
     alignment(min_alignment(align)),
-    node_index_(cv.begin(), cv.end(), pad(alignment)),
-    iX_(cv.size(), NAN, pad(alignment)),
-    eX_(init_eX.begin(), init_eX.end(), pad(alignment)),
-    Xi_(cv.size(), NAN, pad(alignment)),
-    Xo_(cv.size(), NAN, pad(alignment)),
-    init_Xi_(init_Xi.begin(), init_Xi.end(), pad(alignment)),
-    init_Xo_(init_Xo.begin(), init_Xo.end(), pad(alignment)),
-    init_eX_(init_eX.begin(), init_eX.end(), pad(alignment)),
+    node_index_(ion_data.cv.begin(), ion_data.cv.end(), pad(alignment)),
+    iX_(ion_data.cv.size(), NAN, pad(alignment)),
+    eX_(ion_data.init_revpot.begin(), ion_data.init_revpot.end(), pad(alignment)),
+    Xi_(ion_data.cv.size(), NAN, pad(alignment)),
+    Xo_(ion_data.cv.size(), NAN, pad(alignment)),
+    init_Xi_(ion_data.init_iconc.begin(), ion_data.init_iconc.end(), pad(alignment)),
+    init_Xo_(ion_data.init_econc.begin(), ion_data.init_econc.end(), pad(alignment)),
+    reset_Xi_(ion_data.reset_iconc.begin(), ion_data.reset_iconc.end(), pad(alignment)),
+    reset_Xo_(ion_data.reset_econc.begin(), ion_data.reset_econc.end(), pad(alignment)),
+    init_eX_(ion_data.init_revpot.begin(), ion_data.init_revpot.end(), pad(alignment)),
     charge(1u, charge, pad(alignment))
 {
     arb_assert(node_index_.size()==init_Xi_.size());
@@ -82,7 +82,8 @@ void ion_state::zero_current() {
 
 void ion_state::reset() {
     zero_current();
-    init_concentration();
+    std::copy(reset_Xi_.begin(), reset_Xi_.end(), Xi_.begin());
+    std::copy(reset_Xo_.begin(), reset_Xo_.end(), Xo_.begin());
     std::copy(init_eX_.begin(), init_eX_.end(), eX_.begin());
 }
 
@@ -134,14 +135,11 @@ shared_state::shared_state(
 void shared_state::add_ion(
     const std::string& ion_name,
     int charge,
-    const std::vector<fvm_index_type>& cv,
-    const std::vector<fvm_value_type>& init_iconc,
-    const std::vector<fvm_value_type>& init_econc,
-    const std::vector<fvm_value_type>& init_erev)
+    const fvm_ion_config& ion_info)
 {
     ion_data.emplace(std::piecewise_construct,
         std::forward_as_tuple(ion_name),
-        std::forward_as_tuple(charge, cv, init_iconc, init_econc, init_erev, alignment));
+        std::forward_as_tuple(charge, ion_info, alignment));
 }
 
 void shared_state::reset() {
@@ -171,27 +169,38 @@ void shared_state::ions_init_concentration() {
 }
 
 void shared_state::update_time_to(fvm_value_type dt_step, fvm_value_type tmax) {
+    using simd::assign;
+    using simd::indirect;
+    using simd::add;
+    using simd::min;
     for (fvm_size_type i = 0; i<n_intdom; i+=simd_width) {
-        simd_value_type t(time.data()+i);
-        t = min(t+dt_step, simd_value_type(tmax));
-        t.copy_to(time_to.data()+i);
+        simd_value_type t;
+        assign(t, indirect(time.data()+i, simd_width));
+        t = min(add(t, dt_step), tmax);
+        indirect(time_to.data()+i, simd_width) = t;
     }
 }
 
 void shared_state::set_dt() {
+    using simd::assign;
+    using simd::indirect;
+    using simd::sub;
     for (fvm_size_type j = 0; j<n_intdom; j+=simd_width) {
-        simd_value_type t(time.data()+j);
-        simd_value_type t_to(time_to.data()+j);
+        simd_value_type t, t_to;
+        assign(t, indirect(time.data()+j, simd_width));
+        assign(t_to, indirect(time_to.data()+j, simd_width));
 
-        auto dt = t_to-t;
-        dt.copy_to(dt_intdom.data()+j);
+        auto dt = sub(t_to,t);
+        indirect(dt_intdom.data()+j, simd_width) = dt;
     }
 
     for (fvm_size_type i = 0; i<n_cv; i+=simd_width) {
-        simd_index_type intdom_idx(cv_to_intdom.data()+i);
+        simd_index_type intdom_idx;
+        assign(intdom_idx, indirect(cv_to_intdom.data()+i, simd_width));
 
-        simd_value_type dt(simd::indirect(dt_intdom.data(), intdom_idx));
-        dt.copy_to(dt_cv.data()+i);
+        simd_value_type dt;
+        assign(dt, indirect(dt_intdom.data(), intdom_idx, simd_width));
+        indirect(dt_cv.data()+i, simd_width) = dt;
     }
 }
 

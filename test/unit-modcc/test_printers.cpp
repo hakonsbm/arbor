@@ -8,12 +8,9 @@
 
 #include "printer/cexpr_emit.hpp"
 #include "printer/cprinter.hpp"
-#include "printer/cudaprinter.hpp"
+#include "printer/gpuprinter.hpp"
 #include "expression.hpp"
 #include "symdiff.hpp"
-
-// Note: CUDA printer disabled until new implementation finished.
-//#include "printer/cudaprinter.hpp"
 
 struct testcase {
     const char* source;
@@ -70,7 +67,7 @@ TEST(scalar_printer, statement) {
         {"z=a-(b+c)",        "z=a-(b+c)"},
         {"z=(a>0)<(b>0)",    "z=a>0.<(b>0.)"},
         {"z=a- -2",          "z=a- -2"},
-        {"z=abs(x-z)",       "z=fabs(x-z)"},
+        {"z=fabs(x-z)",      "z=abs(x-z)"},
         {"z=min(x,y)",       "z=min(x,y)"},
         {"z=min(max(a,b),y)","z=min(max(a,b),y)"},
     };
@@ -88,7 +85,10 @@ TEST(scalar_printer, statement) {
         ASSERT_TRUE(e);
 
         e->semantic(scope);
-
+        if(e->has_error()) {
+            std::cerr << e->error_message() << std::endl;
+            FAIL();
+        }
         {
             SCOPED_TRACE("CPrinter");
             std::stringstream out;
@@ -101,9 +101,9 @@ TEST(scalar_printer, statement) {
         }
 
         {
-            SCOPED_TRACE("CudaPrinter");
+            SCOPED_TRACE("GpuPrinter");
             std::stringstream out;
-            auto printer = std::make_unique<CudaPrinter>(out);
+            auto printer = std::make_unique<GpuPrinter>(out);
             e->accept(printer.get());
             std::string text = out.str();
 
@@ -200,37 +200,54 @@ TEST(CPrinter, proc_body_const) {
 
 TEST(CPrinter, proc_body_inlined) {
     const char* expected =
-        "    r_0_ = s2[i_]/ 3;\n"
-        "    r_3_ = s1[i_]+ 2;\n"
-        "    if (s1[i_]== 3) {\n"
-        "        r_2_ =  2*r_3_;\n"
-        "    }\n"
-        "    else if (s1[i_]== 4) {\n"
-        "        r_2_ = r_3_;\n"
-        "    }\n"
-        "    else {\n"
-        "        r_5_ = exp(r_3_);\n"
-        "        r_2_ = r_5_*s1[i_];\n"
-        "    }\n"
-        "\n"
-        "    r_7_ = r_0_/s2[i_];\n"
-        "    r_8_ = log(r_7_);\n"
-        "    r_6_ =  42*r_8_;\n"
-        "    r_1_ = r_0_*r_6_;\n"
-        "    t0 = r_2_*r_1_;\n"
-        "    t1 = exprelr(t0);\n"
-        "    ll0_ = t1+ 2;\n"
-        "    if (ll0_== 3) {\n"
-        "        t2 =  10;\n"
-        "    }\n"
-        "    else if (ll0_== 4) {\n"
-        "        t2 =  5;\n"
-        "    }\n"
-        "    else {\n"
-        "        r_4_ =  148.4131591025766;\n"
-        "        t2 = r_4_*ll0_;\n"
-        "    }\n"
-        "    s2[i_] = t2+ 4;";
+        "ll0_ = 0.;\n"
+        "r_6_ = 0.;\n"
+        "r_7_ = 0.;\n"
+        "r_8_ = 0.;\n"
+        "r_9_=s2[i_]*0.33333333333333331;\n"
+        "r_8_=s1[i_]+2;\n"
+        "if(s1[i_]==3){\n"
+        "   r_7_=2*r_8_;\n"
+        "}\n"
+        "else{\n"
+        "   if(s1[i_]==4){\n"
+        "       r_11_ = 0.;\n"
+        "       r_12_ = 0.;\n"
+        "       r_12_=6+s1[i_];\n"
+        "       r_11_=r_12_;\n"
+        "       r_7_=r_8_*r_11_;\n"
+        "   }\n"
+        "   else{\n"
+        "       r_10_=exp(r_8_);\n"
+        "       r_7_=r_10_*s1[i_];\n"
+        "   }\n"
+        "}\n"
+        "r_13_=0.;\n"
+        "r_14_=0.;\n"
+        "r_14_=r_9_/s2[i_];\n"
+        "r_15_=log(r_14_);\n"
+        "r_13_=42*r_15_;\n"
+        "r_6_=r_9_*r_13_;\n"
+        "t0=r_7_*r_6_;\n"
+        "t1=exprelr(t0);\n"
+        "ll0_=t1+2;\n"
+        "if(ll0_==3){\n"
+        "   t2=10;\n"
+        "}\n"
+        "else{\n"
+        "   if(ll0_==4){\n"
+        "       r_17_=0.;\n"
+        "       r_18_=0.;\n"
+        "       r_18_=6+ll0_;\n"
+        "       r_17_=r_18_;\n"
+        "       t2=5*r_17_;\n"
+        "   }\n"
+        "   else{\n"
+        "       r_16_=148.4131591025766;\n"
+        "       t2=r_16_*ll0_;\n"
+        "   }\n"
+        "}\n"
+        "s2[i_]=t2+4;\n";
 
     Module m(io::read_all(DATADIR "/mod_files/test6.mod"), "test6.mod");
     Parser p(m, false);
@@ -255,4 +272,62 @@ TEST(CPrinter, proc_body_inlined) {
     proc_with_locals.erase(0, proc_with_locals.find(";") + 1);
 
     EXPECT_EQ(strip(expected), proc_with_locals);
+}
+
+TEST(SimdPrinter, simd_if_else) {
+    std::vector<const char*> expected_procs = {
+            "simd_value u;\n"
+            "simd_mask mask_0_ = S::cmp_gt(i, (double)2);\n"
+            "S::where(mask_0_,u) = (double)7;\n"
+            "S::where(S::logical_not(mask_0_),u) = (double)5;\n"
+            "indirect(s+i_, simd_width_) = S::where(S::logical_not(mask_0_),simd_cast<simd_value>((double)42));\n"
+            "indirect(s+i_, simd_width_) = u;"
+            ,
+            "simd_value u;\n"
+            "simd_mask mask_1_ = S::cmp_gt(i, (double)2);\n"
+            "S::where(mask_1_,u) = (double)7;\n"
+            "S::where(S::logical_not(mask_1_),u) = (double)5;\n"
+            "indirect(s+i_, simd_width_) = S::where(S::logical_and(S::logical_not(mask_1_), mask_input_),simd_cast<simd_value>((double)42));\n"
+            "indirect(s+i_, simd_width_) = S::where(mask_input_, u);"
+            ,
+            "simd_mask mask_2_ = S::cmp_gt(simd_cast<simd_value>(indirect(g+i_, simd_width_)), (double)2);\n"
+            "simd_mask mask_3_ = S::cmp_gt(simd_cast<simd_value>(indirect(g+i_, simd_width_)), (double)3);\n"
+            "S::where(S::logical_and(mask_2_,mask_3_),i) = (double)0.;\n"
+            "S::where(S::logical_and(mask_2_,S::logical_not(mask_3_)),i) = (double)1;\n"
+            "simd_mask mask_4_ = S::cmp_lt(simd_cast<simd_value>(indirect(g+i_, simd_width_)), (double)1);\n"
+            "indirect(s+i_, simd_width_) = S::where(S::logical_and(S::logical_not(mask_2_),mask_4_),simd_cast<simd_value>((double)2));\n"
+            "rates(i_, S::logical_and(S::logical_not(mask_2_),S::logical_not(mask_4_)), i);"
+    };
+
+    Module m(io::read_all(DATADIR "/mod_files/test7.mod"), "test7.mod");
+    Parser p(m, false);
+    p.parse();
+    m.semantic();
+
+    struct proc {
+        std::string name;
+        bool masked;
+    };
+
+    std::vector<proc> procs = {{"rates", false}, {"rates", true}, {"foo", false}};
+    for (unsigned i = 0; i < procs.size(); i++) {
+        auto p = procs[i];
+        std::stringstream out;
+        auto &proc = m.symbols().at(p.name);
+        ASSERT_TRUE(proc->is_symbol());
+
+        auto v = std::make_unique<SimdPrinter>(out);
+        if (p.masked) {
+            v->set_input_mask("mask_input_");
+        }
+        proc->is_procedure()->body()->accept(v.get());
+        std::string text = out.str();
+
+        verbose_print(proc->is_procedure()->body()->to_string());
+        verbose_print(" :--: ", text);
+
+        auto proc_with_locals = strip(text);
+        EXPECT_EQ(strip(expected_procs[i]), proc_with_locals);
+
+    }
 }

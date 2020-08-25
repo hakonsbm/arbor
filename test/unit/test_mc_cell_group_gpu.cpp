@@ -1,6 +1,7 @@
 #include "../gtest.h"
 
 #include <arbor/common_types.hpp>
+#include <arborenv/gpu_env.hpp>
 
 #include "epoch.hpp"
 #include "execution_context.hpp"
@@ -14,7 +15,9 @@ using namespace arb;
 
 namespace {
     fvm_lowered_cell_ptr lowered_cell() {
-        execution_context context;
+        arb::proc_allocation resources;
+        resources.gpu_id = arbenv::default_gpu();
+        execution_context context(resources);
         return make_fvm_lowered_cell(backend_kind::gpu, context);
     }
 
@@ -24,8 +27,8 @@ namespace {
         cable_cell c = builder.make_cell();
         c.paint("soma", "hh");
         c.paint("dend", "pas");
-        c.place(mlocation{1,1}, i_clamp{5, 80, 0.3});
-        c.place(mlocation{0, 0}, threshold_detector{0});
+        c.place(builder.location({1, 1}), i_clamp{5, 80, 0.3});
+        c.place(builder.location({0, 0}), threshold_detector{0});
         return c;
     }
 }

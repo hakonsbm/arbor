@@ -21,7 +21,7 @@ set(libmodcc_sources
     io/prefixbuf.cpp
     printer/cexpr_emit.cpp
     printer/cprinter.cpp
-    printer/cudaprinter.cpp
+    printer/gpuprinter.cpp
     printer/infoprinter.cpp
     printer/printerutil.cpp
 )
@@ -33,7 +33,7 @@ target_include_directories(libmodcc PUBLIC .)
 set_target_properties(libmodcc PROPERTIES OUTPUT_NAME modcc)
 
 add_executable(modcc ${modcc_sources})
-target_link_libraries(modcc libmodcc ext-tclap)
+target_link_libraries(modcc libmodcc ext-tinyopt)
 
 set_target_properties(modcc libmodcc PROPERTIES EXCLUDE_FROM_ALL ${ARB_WITH_EXTERNAL_MODCC})
 

@@ -3,6 +3,8 @@
 #include <util/partition.hpp>
 #include <util/span.hpp>
 
+#include <memory/memory.hpp>
+
 #include "multicore_common.hpp"
 
 namespace arb {
@@ -61,7 +63,9 @@ public:
 
             u[i] = -gij;
             invariant_d[i] += gij;
-            invariant_d[p[i]] += gij;
+            if (p[i]!=-1) {
+                invariant_d[p[i]] += gij;
+            }
         }
     }
 
@@ -129,6 +133,12 @@ public:
                 }
             }
         }
+    }
+
+    template<typename VTo>
+    void solve(VTo& to) {
+        solve();
+        memory::copy(rhs, to);
     }
 
 private:

@@ -6,12 +6,14 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <iosfwd>
 #include <type_traits>
 
 #include <arbor/util/lexcmp_def.hpp>
+#include <arbor/util/hash_def.hpp>
 
 namespace arb {
 
@@ -53,7 +55,7 @@ ARB_DEFINE_LEXICOGRAPHIC_ORDERING(cell_member_type,(a.gid,a.index),(b.gid,b.inde
 
 // For storing time values [ms]
 
-using time_type = float;
+using time_type = double;
 constexpr time_type terminal_time = std::numeric_limits<time_type>::max();
 
 // Extra contextual information associated with a probe.
@@ -95,15 +97,4 @@ std::ostream& operator<<(std::ostream& o, backend_kind k);
 
 } // namespace arb
 
-namespace std {
-    template <> struct hash<arb::cell_member_type> {
-        std::size_t operator()(const arb::cell_member_type& m) const {
-            using namespace arb;
-            static_assert(sizeof(std::size_t)>sizeof(cell_gid_type), "invalid size assumptions for hash of cell_member_type");
-
-            std::size_t k = ((std::size_t)m.gid << (8*sizeof(cell_gid_type))) + m.index;
-            return std::hash<std::size_t>{}(k);
-        }
-    };
-}
-
+ARB_DEFINE_HASH(arb::cell_member_type, a.gid, a.index)

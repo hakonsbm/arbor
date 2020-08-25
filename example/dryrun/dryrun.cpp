@@ -3,13 +3,13 @@
  *
  */
 
+#include <cassert>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 
 #include <nlohmann/json.hpp>
 
-#include <arbor/assert_macro.hpp>
 #include <arbor/common_types.hpp>
 #include <arbor/context.hpp>
 #include <arbor/cable_cell.hpp>
@@ -17,7 +17,6 @@
 #include <arbor/morph/primitives.hpp>
 #include <arbor/profile/meter_manager.hpp>
 #include <arbor/profile/profiler.hpp>
-#include <arbor/simple_sampler.hpp>
 #include <arbor/simulation.hpp>
 #include <arbor/symmetric_recipe.hpp>
 #include <arbor/recipe.hpp>
@@ -52,7 +51,6 @@ using arb::cell_size_type;
 using arb::cell_member_type;
 using arb::cell_kind;
 using arb::time_type;
-using arb::cell_probe_address;
 
 // Generate a cell.
 arb::cable_cell branch_cell(arb::cell_gid_type gid, const cell_parameters& params);
@@ -121,18 +119,9 @@ public:
         return gens;
     }
 
-    // There is one probe (for measuring voltage at the soma) on the cell.
-    cell_size_type num_probes(cell_gid_type gid)  const override {
-        return 1;
-    }
-
-    arb::probe_info get_probe(cell_member_type id) const override {
-        // Get the appropriate kind for measuring voltage.
-        cell_probe_address::probe_kind kind = cell_probe_address::membrane_voltage;
-        // Measure at the soma.
-        arb::mlocation loc{0, 0.0};
-
-        return arb::probe_info{id, kind, cell_probe_address{loc, kind}};
+    std::vector<arb::probe_info> get_probes(cell_gid_type gid) const override {
+        // One probe per cell, sampling membrane voltage at end of soma.
+        return {arb::cable_probe_membrane_voltage{arb::mlocation{0, 0.0}}};
     }
 
 private:
@@ -141,68 +130,6 @@ private:
     cell_parameters cell_params_;
     double min_delay_;
     float event_weight_ = 0.01;
-};
-
-struct cell_stats {
-    using size_type = unsigned;
-    size_type ncells = 0;
-    int nranks = 1;
-    size_type nsegs = 0;
-    size_type ncomp = 0;
-
-    cell_stats(arb::recipe& r, run_params params) {
-#ifdef ARB_MPI_ENABLED
-        if(!params.dry_run) {
-            int rank;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-            ncells = r.num_cells();
-            size_type cells_per_rank = ncells/nranks;
-            size_type b = rank*cells_per_rank;
-            size_type e = (rank+1)*cells_per_rank;
-            size_type nsegs_tmp = 0;
-            size_type ncomp_tmp = 0;
-            for (size_type i=b; i<e; ++i) {
-                auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-                nsegs_tmp += c.num_branches();
-                ncomp_tmp += c.num_compartments();
-            }
-            MPI_Allreduce(&nsegs_tmp, &nsegs, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(&ncomp_tmp, &ncomp, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-        }
-#else
-        if(!params.dry_run) {
-            nranks = 1;
-            ncells = r.num_cells();
-            for (size_type i = 0; i < ncells; ++i) {
-                auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-                nsegs += c.num_branches();
-                ncomp += c.num_compartments();
-            }
-        }
-#endif
-        else {
-            nranks = params.num_ranks;
-            ncells = r.num_cells(); //total number of cells across all ranks
-
-            for (size_type i = 0; i < params.num_cells_per_rank; ++i) {
-                auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-                nsegs += c.num_branches();
-                ncomp += c.num_compartments();
-            }
-
-            nsegs *= params.num_ranks;
-            ncomp *= params.num_ranks;
-        }
-    }
-
-    friend std::ostream& operator<<(std::ostream& o, const cell_stats& s) {
-        return o << "cell stats: "
-                 << s.nranks << " ranks; "
-                 << s.ncells << " cells; "
-                 << s.nsegs << " branches; "
-                 << s.ncomp << " compartments.";
-    }
 };
 
 int main(int argc, char** argv) {
@@ -229,7 +156,7 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        arb_assert(arb::num_ranks(ctx)==params.num_ranks);
+        assert(arb::num_ranks(ctx)==params.num_ranks);
 
 
 #ifdef ARB_PROFILE_ENABLED
@@ -252,9 +179,6 @@ int main(int argc, char** argv) {
         auto tile = std::make_unique<tile_desc>(params.num_cells_per_rank,
                 params.num_ranks, params.cell, params.min_delay);
         arb::symmetric_recipe recipe(std::move(tile));
-
-        cell_stats stats(recipe, params);
-        std::cout << stats << "\n";
 
         auto decomp = arb::partition_load_balance(recipe, ctx);
 

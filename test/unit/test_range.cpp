@@ -1,6 +1,7 @@
 #include "../gtest.h"
 
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <functional>
 #include <list>
@@ -478,6 +479,26 @@ TEST(range, sort) {
     EXPECT_EQ(X, (std::vector<foo>{{0, 5}, {1, 4}, {2, 3}, {3, 2}, {4, 1}, {5, 0}}));
 }
 
+TEST(range, sum) {
+    std::string words[] = { "fish", "cakes", "!" };
+
+    auto result = util::sum(words);
+    EXPECT_EQ("fishcakes!", result);
+
+    result = util::sum(words, "tasty"s);
+    EXPECT_EQ("tastyfishcakes!", result);
+
+    struct uwrap {
+        unsigned value = 0;
+        uwrap(unsigned v): value(v) {}
+
+        uwrap operator+(const std::string& s) { return value+s.size(); }
+    };
+
+    auto count = util::sum(words, uwrap{3});
+    EXPECT_EQ(3u+4u+5u+1u, count.value);
+}
+
 TEST(range, sum_by) {
     std::string words[] = { "fish", "cakes", "!" };
     auto prepend_ = [](const std::string& x) { return "_"+x; };
@@ -648,6 +669,63 @@ TEST(range, is_sorted_by) {
     EXPECT_TRUE(util::is_sorted_by(seq, [](int x) { return x+2; }, std::greater<int>{}));
 }
 
+template <typename V>
+struct repeat_iterator {
+    typedef std::input_iterator_tag iterator_category;
+    typedef const V& reference;
+    typedef const V* pointer;
+    typedef V value_type;
+    typedef std::ptrdiff_t difference_type;
+
+    V v;
+    repeat_iterator(V v): v(std::move(v)) {}
+
+    bool operator==(const repeat_iterator<V>& i) const { return true; }
+    bool operator!=(const repeat_iterator<V>& i) const { return false; }
+    reference operator*() const { return v; }
+    repeat_iterator& operator++() { return *this; }
+    repeat_iterator& operator++(int) { return *this; }
+    pointer operator->() const { return &v; }
+};
+
+struct never_t {
+    template <typename X> friend bool operator==(never_t, const X&) { return false; }
+    template <typename X> friend bool operator==(const X&, never_t) { return false; }
+
+    template <typename X> friend bool operator!=(never_t, const X&) { return true; }
+    template <typename X> friend bool operator!=(const X&, never_t) { return true; }
+};
+static never_t never;
+
+template <typename V>
+auto repeat(V v) { return util::make_range(repeat_iterator<V>(std::move(v)), never); }
+
+TEST(range, equal) {
+    // Finite containers
+    unsigned a[5] = { 1, 3, 2, 5, 4};
+    std::array<unsigned, 5> b = { 1, 3, 2, 5, 4};
+
+    EXPECT_TRUE(util::equal(a, b));
+
+    a[3] = 10;
+    EXPECT_FALSE(util::equal(a, b));
+
+    unsigned abis[6] = { 1, 3, 2, 5, 4, 6};
+    EXPECT_FALSE(util::equal(abis, b));
+
+    std::vector<std::string> empty1;
+    std::vector<std::string> empty2;
+    EXPECT_TRUE(util::equal(empty1, empty2));
+
+    empty2.push_back("hello");
+    EXPECT_FALSE(util::equal(empty1, empty2));
+
+    // Infinite sequence
+    unsigned c[3] = { 2, 2, 2 };
+    EXPECT_FALSE(util::equal(c, repeat(2u)));
+    EXPECT_FALSE(util::equal(repeat(5u), repeat(2u)));
+}
+
 TEST(range, reverse) {
     // make a C string into a sentinel-terminated range
     auto cstr = [](const char* s) { return util::make_range(s, null_terminated); };
@@ -656,4 +734,34 @@ TEST(range, reverse) {
     util::assign(rev, util::reverse_view(cstr("hello")));
 
     EXPECT_EQ("olleh"s, rev);
+}
+
+TEST(range, foldl) {
+    // Check invocation order:
+    int xs[] = {1, 2, 3, 4};
+    int result = util::foldl(
+        [](int l, int r) { return 10*l+r; },
+        0,
+        xs);
+
+    EXPECT_EQ(1234, result);
+
+    // Check mutability permission:
+    result = util::foldl(
+        [](int l, int& r) { return ++r, 10*l+r; },
+        0,
+        xs);
+    EXPECT_EQ(2345, result);
+    EXPECT_EQ(5,xs[3]);
+
+    // Check works with move-only values:
+    nocopy<int> ns[] = {1, 2, 3, 4};
+    auto plus = [](nocopy<int> a, nocopy<int> b) { return nocopy<int>(10*a.value + b.value); };
+    auto nc_result = util::foldl(
+        [&plus](auto a, auto& b) { return plus(std::move(a), std::move(b)); },
+        nocopy<int>(0),
+        ns);
+
+    EXPECT_EQ(1234, nc_result.value);
+    EXPECT_EQ(0, ns[3].value);
 }

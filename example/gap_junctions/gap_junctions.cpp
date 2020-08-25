@@ -53,10 +53,9 @@ using arb::cell_size_type;
 using arb::cell_member_type;
 using arb::cell_kind;
 using arb::time_type;
-using arb::cell_probe_address;
 
 // Writes voltage trace as a json file.
-void write_trace_json(const std::vector<arb::trace_data<double>>& trace, unsigned rank);
+void write_trace_json(const std::vector<arb::trace_vector<double>>& trace, unsigned rank);
 
 // Generate a cell.
 arb::cable_cell gj_cell(cell_gid_type gid, unsigned ncells, double stim_duration);
@@ -94,18 +93,10 @@ public:
         return {arb::cell_connection({gid - 1, 0}, {gid, 0}, params_.event_weight, params_.event_min_delay)};
     }
 
-    // There is one probe (for measuring voltage at the soma) on the cell.
-    cell_size_type num_probes(cell_gid_type gid)  const override {
-        return 1;
-    }
-
-    arb::probe_info get_probe(cell_member_type id) const override {
-        // Get the appropriate kind for measuring voltage.
-        cell_probe_address::probe_kind kind = cell_probe_address::membrane_voltage;
-        // Measure at the soma.
+    std::vector<arb::probe_info> get_probes(cell_gid_type gid) const override {
+        // Measure membrane voltage at end of soma.
         arb::mlocation loc{0, 1.};
-
-        return arb::probe_info{id, kind, cell_probe_address{loc, kind}};
+        return {arb::cable_probe_membrane_voltage{loc}};
     }
 
     arb::util::any get_global_properties(cell_kind k) const override {
@@ -141,49 +132,6 @@ public:
 private:
     gap_params params_;
 };
-
-struct cell_stats {
-    using size_type = unsigned;
-    size_type ncells = 0;
-    size_type nsegs = 0;
-    size_type ncomp = 0;
-
-    cell_stats(arb::recipe& r) {
-#ifdef ARB_MPI_ENABLED
-        int nranks, rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-        ncells = r.num_cells();
-        size_type cells_per_rank = ncells/nranks;
-        size_type b = rank*cells_per_rank;
-        size_type e = (rank==nranks-1)? ncells: (rank+1)*cells_per_rank;
-        size_type nsegs_tmp = 0;
-        size_type ncomp_tmp = 0;
-        for (size_type i=b; i<e; ++i) {
-            auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-            nsegs_tmp += c.num_branches();
-            ncomp_tmp += c.num_compartments();
-        }
-        MPI_Allreduce(&nsegs_tmp, &nsegs, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&ncomp_tmp, &ncomp, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD);
-#else
-        ncells = r.num_cells();
-        for (size_type i=0; i<ncells; ++i) {
-            auto c = arb::util::any_cast<arb::cable_cell>(r.get_cell_description(i));
-            nsegs += c.num_branches();
-            ncomp += c.num_compartments();
-        }
-#endif
-    }
-
-    friend std::ostream& operator<<(std::ostream& o, const cell_stats& s) {
-        return o << "cell stats: "
-                 << s.ncells << " cells; "
-                 << s.nsegs << " branchess; "
-                 << s.ncomp << " compartments.";
-    }
-};
-
 
 int main(int argc, char** argv) {
     try {
@@ -231,9 +179,6 @@ int main(int argc, char** argv) {
         // Create an instance of our recipe.
         gj_recipe recipe(params);
 
-        cell_stats stats(recipe);
-        std::cout << stats << "\n";
-
         auto decomp = arb::partition_load_balance(recipe, context);
 
         // Construct the model.
@@ -243,14 +188,13 @@ int main(int argc, char** argv) {
 
         auto sched = arb::regular_schedule(0.025);
         // This is where the voltage samples will be stored as (time, value) pairs
-        std::vector<arb::trace_data<double>> voltage(decomp.num_local_cells);
+        std::vector<arb::trace_vector<double>> voltage_traces(decomp.num_local_cells);
 
         // Now attach the sampler at probe_id, with sampling schedule sched, writing to voltage
         unsigned j=0;
         for (auto g : decomp.groups) {
             for (auto i : g.gids) {
-                auto t = recipe.get_probe({i, 0});
-                sim.add_sampler(arb::one_probe(t.id), sched, arb::make_simple_sampler(voltage[j++]));
+                sim.add_sampler(arb::one_probe({i, 0}), sched, arb::make_simple_sampler(voltage_traces[j++]));
             }
         }
 
@@ -294,7 +238,7 @@ int main(int argc, char** argv) {
 
         // Write the samples to a json file.
         if (params.print_all) {
-            write_trace_json(voltage, arb::rank(context));
+            write_trace_json(voltage_traces, arb::rank(context));
         }
 
         auto report = arb::profile::make_meter_report(meters, context);
@@ -308,8 +252,8 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-void write_trace_json(const std::vector<arb::trace_data<double>>& trace, unsigned rank) {
-    for (unsigned i = 0; i < trace.size(); i++) {
+void write_trace_json(const std::vector<arb::trace_vector<double>>& traces, unsigned rank) {
+    for (unsigned i = 0; i < traces.size(); i++) {
         std::string path = "./voltages_" + std::to_string(rank) +
                            "_" + std::to_string(i) + ".json";
 
@@ -323,7 +267,7 @@ void write_trace_json(const std::vector<arb::trace_data<double>>& trace, unsigne
         auto &jt = json["data"]["time"];
         auto &jy = json["data"]["voltage"];
 
-        for (const auto &sample: trace[i]) {
+        for (const auto &sample: traces[i].at(0)) {
             jt.push_back(sample.t);
             jy.push_back(sample.v);
         }
@@ -335,12 +279,11 @@ void write_trace_json(const std::vector<arb::trace_data<double>>& trace, unsigne
 
 arb::cable_cell gj_cell(cell_gid_type gid, unsigned ncell, double stim_duration) {
     // Create the sample tree that defines the morphology.
-    arb::sample_tree tree;
+    arb::segment_tree tree;
     double soma_rad = 22.360679775/2.0; // convert diameter to radius in μm
-    tree.append({{0,0,0,soma_rad}, 1}); // soma is a single sample point
-    double dend_rad = 3./2;
-    tree.append(0, {{0,0,soma_rad,     dend_rad}, 3});  // proximal point of the dendrite
-    tree.append(1, {{0,0,soma_rad+300, dend_rad}, 3});  // distal end of the dendrite
+    tree.append(arb::mnpos, {0,0,0,soma_rad}, {0,0,2*soma_rad,soma_rad}, 1); // soma
+    double dend_rad = 3./2; // μm
+    tree.append(0, {0,0,2*soma_rad, dend_rad}, {0,0,2*soma_rad+300, dend_rad}, 3);  // dendrite
 
     // Create a label dictionary that creates a single region that covers the whole cell.
     arb::label_dict d;

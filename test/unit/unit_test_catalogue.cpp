@@ -7,8 +7,10 @@
 #include "backends/multicore/fvm.hpp"
 
 #include "unit_test_catalogue.hpp"
+#include "mechanisms/ca_linear.hpp"
 #include "mechanisms/celsius_test.hpp"
 #include "mechanisms/diam_test.hpp"
+#include "mechanisms/param_as_state.hpp"
 #include "mechanisms/test0_kin_diff.hpp"
 #include "mechanisms/test_linear_state.hpp"
 #include "mechanisms/test_linear_init.hpp"
@@ -29,8 +31,14 @@
 #include "mechanisms/test_cl_valence.hpp"
 #include "mechanisms/test_ca_read_valence.hpp"
 #include "mechanisms/read_eX.hpp"
+#include "mechanisms/write_Xi_Xo.hpp"
 #include "mechanisms/write_multiple_eX.hpp"
 #include "mechanisms/write_eX.hpp"
+#include "mechanisms/read_cai_init.hpp"
+#include "mechanisms/write_cai_breakpoint.hpp"
+#include "mechanisms/test_ca.hpp"
+#include "mechanisms/test_kin1.hpp"
+#include "mechanisms/test_kinlva.hpp"
 
 #include "../gtest.h"
 
@@ -47,11 +55,16 @@ c.register_implementation(#x, testing::make_mechanism_##x<gpu::backend>());
 
 using namespace arb;
 
-mechanism_catalogue make_unit_test_catalogue() {
-    mechanism_catalogue cat;
+mechanism_catalogue make_unit_test_catalogue(const mechanism_catalogue& from) {
+    mechanism_catalogue cat(from);
 
+    ADD_MECH(cat, test_ca)
+    ADD_MECH(cat, test_kin1)
+    ADD_MECH(cat, test_kinlva)
+    ADD_MECH(cat, ca_linear)
     ADD_MECH(cat, celsius_test)
     ADD_MECH(cat, diam_test)
+    ADD_MECH(cat, param_as_state)
     ADD_MECH(cat, test_linear_state)
     ADD_MECH(cat, test_linear_init)
     ADD_MECH(cat, test_linear_init_shuffle)
@@ -72,8 +85,11 @@ mechanism_catalogue make_unit_test_catalogue() {
     ADD_MECH(cat, test_cl_valence)
     ADD_MECH(cat, test_ca_read_valence)
     ADD_MECH(cat, read_eX)
+    ADD_MECH(cat, write_Xi_Xo)
     ADD_MECH(cat, write_multiple_eX)
     ADD_MECH(cat, write_eX)
+    ADD_MECH(cat, read_cai_init)
+    ADD_MECH(cat, write_cai_breakpoint)
 
     return cat;
 }
